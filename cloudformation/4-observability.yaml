@@ -1,0 +1,1454 @@
+# =============================================================================
+# WizTT - Stack 4: Observability & DNS
+# =============================================================================
+# Description:
+#   Deploys all observability, security monitoring, and DNS infrastructure
+#   for the WizTT environment. This stack provides full visibility into
+#   the environment through multiple complementary monitoring layers.
+#
+# Deployment Order: 4 of 5
+# Depends On:      Stack 1 (VPC & Networking), Stack 3 (Compute)
+# Exports To:      Stack 5 (Application - ACM cert ARN, hosted zone IDs)
+#
+# Resources Created:
+#   Observability:
+#     - CloudTrail (multi-service audit logging → S3 + CloudWatch)
+#     - CloudWatch Log Groups (MongoDB, WAF, CloudTrail)
+#     - CloudWatch Alarms (CPU, memory, WAF blocked requests)
+#     - CloudWatch Dashboard (unified environment overview)
+#
+#   NOTE: K8s Master and Worker CloudWatch log groups are created in
+#   Stack 3 (Compute) to avoid a race condition where instances create
+#   these groups on boot before Stack 4 can create them.
+#   Their log group names are imported here via cross-stack references.
+#
+#   Security Monitoring:
+#     - Amazon GuardDuty (threat detection - foundational + S3 protection)
+#     - Amazon Inspector v2 (EC2 vulnerability scanning) - enabled manually
+#     - AWS WAF v2 Web ACL (attached to ALB in Stack 5)
+#     - WAF Logging Configuration
+#
+#   DNS:
+#     - Route 53 Public Hosted Zone (pre-created, referenced via parameter)
+#     - Route 53 Private Hosted Zone (internal.wizdemo.ca)
+#     - Route 53 A Record (mongodb.internal.wizdemo.ca → MongoDB private IP)
+#     - ACM Certificate (tasky.wizdemo.ca - DNS validated)
+#
+# CI/CD Notes:
+#     - GuardDuty is account-level service. If already enabled in your
+#       account, set EnableGuardDuty to false to avoid conflicts.
+#     - ACM certificate DNS validation requires the Route 53 public
+#       hosted zone to be created first AND NameCheap NS records to be
+#       updated to point to Route 53 before validation can complete.
+#
+# Last Updated:    2026-03-13
+# Version:         2.0.0
+# =============================================================================
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  WizTT Stack 4/5 - Observability & DNS.
+  Deploys CloudTrail, GuardDuty, Amazon AWS WAF, CloudWatch
+  Logs/Alarms/Dashboard, Route 53 public and private hosted zones,
+  ACM certificate, and MongoDB internal DNS record for the WizTT
+  environment.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - EnvironmentName
+          - ProjectName
+      - Label:
+          default: "DNS Configuration"
+        Parameters:
+          - RootDomainName
+          - PublicHostedZoneId
+          - AppSubdomain
+          - InternalDomainName
+      - Label:
+          default: "CloudWatch Configuration"
+        Parameters:
+          - LogRetentionDays
+          - CPUAlarmThreshold
+          - WAFBlockedRequestThreshold
+      - Label:
+          default: "Security Service Configuration"
+        Parameters:
+          - EnableGuardDuty
+          - EnableCloudTrailDataEvents
+          - EnableAWSConfig
+          - EnableMacie
+          - EnableSecurityHub
+      - Label:
+          default: "WAF Configuration"
+        Parameters:
+          - WAFRateLimitThreshold
+
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      RootDomainName:
+        default: "Root Domain Name (e.g., wizdemo.ca)"
+      PublicHostedZoneId:
+        default: "Route 53 Public Hosted Zone ID (pre-created)"
+      AppSubdomain:
+        default: "Application Subdomain (e.g., tasky)"
+      InternalDomainName:
+        default: "Internal DNS Domain (e.g., internal.wizdemo.ca)"
+      LogRetentionDays:
+        default: "CloudWatch Log Retention (Days)"
+      CPUAlarmThreshold:
+        default: "CPU Utilization Alarm Threshold (%)"
+      WAFBlockedRequestThreshold:
+        default: "WAF Blocked Requests Alarm Threshold (per 5 min)"
+      EnableGuardDuty:
+        default: "Enable Amazon GuardDuty"
+      EnableCloudTrailDataEvents:
+        default: "Enable CloudTrail S3 Data Events (additional cost)"
+      EnableAWSConfig:
+        default: "Enable AWS Config Recorder"
+      EnableMacie:
+        default: "Enable Amazon Macie"
+      EnableSecurityHub:
+        default: "Enable AWS Security Hub"
+      WAFRateLimitThreshold:
+        default: "WAF Rate Limit (requests per 5 min per IP)"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: demo
+    AllowedValues:
+      - demo
+      - dev
+      - staging
+      - prod
+    Description: >
+      Must match EnvironmentName used in Stacks 1-3.
+      Used to construct cross-stack import names.
+
+  ProjectName:
+    Type: String
+    Default: WizTT
+    Description: Project name for resource tagging.
+
+  RootDomainName:
+    Type: String
+    Default: wizdemo.ca
+    Description: >
+      Root domain name registered with NameCheap.
+      The Route 53 public hosted zone for this domain must be
+      created manually ONCE before deploying this stack.
+
+  PublicHostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: >
+      The Route 53 Hosted Zone ID for the root domain.
+      Create the public hosted zone manually once via the AWS Console
+      or CLI, delegate NS records to NameCheap, then paste the Zone ID
+      here. This avoids NS re-delegation on every stack rebuild.
+
+  AppSubdomain:
+    Type: String
+    Default: tasky
+    Description: >
+      Subdomain for the Tasky application.
+      Full URL will be: https://{AppSubdomain}.{RootDomainName}
+
+  InternalDomainName:
+    Type: String
+    Default: internal.wizdemo.ca
+    Description: >
+      Private DNS domain for internal VPC resources.
+      Used for: mongodb.internal.wizdemo.ca → MongoDB private IP
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues:
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+    Description: >
+      Retention period for CloudWatch Log Groups in this stack.
+      NOTE: K8s log group retention is set in Stack 3.
+      NOTE: VPC Flow Logs retention is set in Stack 1.
+
+  CPUAlarmThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: >
+      CPU utilization percentage that triggers CloudWatch Alarms
+      for EC2 instances. Default 80% provides early warning before
+      instances become unresponsive.
+
+  WAFBlockedRequestThreshold:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    Description: >
+      Number of WAF blocked requests per 5-minute period that
+      triggers a CloudWatch Alarm.
+
+  EnableGuardDuty:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      Enable Amazon GuardDuty for this account/region.
+      Set to "false" if GuardDuty is already enabled in your account.
+
+  EnableCloudTrailDataEvents:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      Enable CloudTrail S3 data events (GetObject, PutObject, DeleteObject).
+      Cost: ~$0.10 per 100,000 events.
+
+  EnableAWSConfig:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      Enable AWS Config configuration recorder and delivery channel.
+      Set to "false" if Config is already enabled in your account/region.
+
+  EnableMacie:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      Enable Amazon Macie for this account/region.
+      Set to "false" if Macie is already enabled in this region.
+
+  EnableSecurityHub:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      Enable AWS Security Hub for this account/region.
+      Set to "false" if Security Hub is already enabled in this region.
+
+  WAFRateLimitThreshold:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    Description: >
+      Maximum number of requests allowed from a single IP address
+      within a 5-minute window before WAF blocks further requests.
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  GuardDutyEnabled: !Equals [!Ref EnableGuardDuty, "true"]
+  CloudTrailDataEventsEnabled: !Equals [!Ref EnableCloudTrailDataEvents, "true"]
+  AWSConfigEnabled: !Equals [!Ref EnableAWSConfig, "true"]
+  MacieEnabled: !Equals [!Ref EnableMacie, "true"]
+  SecurityHubEnabled: !Equals [!Ref EnableSecurityHub, "true"]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # SECTION 4.1: CLOUDWATCH LOG GROUPS
+  # ===========================================================================
+  # NOTE: K8s Master and Worker log groups are created in Stack 3 (Compute)
+  # to prevent a race condition where EC2 instances auto-create these groups
+  # on boot before this stack can create them. Their names are imported below
+  # via cross-stack references wherever needed.
+  # MongoDB log group is safe to create here as MongoDB does not auto-create it.
+  # ===========================================================================
+
+  # MongoDB logs
+  # Receives: mongod logs, bootstrap logs, backup logs,
+  #           /var/log/secure (SSH auth attempts - important for demo)
+  MongoDBLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: "/aws/ec2/mongodb"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mongodb-logs"
+        - Key: Purpose
+          Value: "MongoDB-Server-Logs"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # WAF logs
+  # IMPORTANT: WAF log group names MUST start with "aws-waf-logs-"
+  WAFLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "aws-waf-logs-${EnvironmentName}"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-waf-logs"
+        - Key: Purpose
+          Value: "WAF-Request-Logs"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudTrail CloudWatch delivery log group
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/cloudtrail/${EnvironmentName}"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-cloudtrail-logs"
+        - Key: Purpose
+          Value: "CloudTrail-API-Audit-Logs"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # SECTION 4.2: AWS CLOUDTRAIL
+  # ===========================================================================
+  CloudTrailCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-cloudtrail-cloudwatch-role"
+      Description: >
+        Allows CloudTrail to deliver log events to CloudWatch Logs.
+        Scoped to the specific CloudTrail log group ARN.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-cloudtrail-cloudwatch-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${CloudTrailLogGroup.Arn}:*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-cloudtrail-cloudwatch-role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WizTTCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: !Sub "${EnvironmentName}-cloudtrail"
+      S3BucketName: !ImportValue
+        Fn::Sub: "${EnvironmentName}-CloudTrailLogsBucketName"
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailCloudWatchRole.Arn
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: false
+      IsLogging: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources: !If
+            - CloudTrailDataEventsEnabled
+            - - Type: "AWS::S3::Object"
+                Values:
+                  - !Sub
+                    - "${BucketArn}/"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "${EnvironmentName}-MongoDBBackupBucketArn"
+                  - !Sub
+                    - "${BucketArn}/"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "${EnvironmentName}-CloudTrailLogsBucketArn"
+            - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-cloudtrail"
+        - Key: Purpose
+          Value: "API-Audit-Logging"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # SECTION 4.3: CLOUDWATCH METRIC FILTERS & ALARMS
+  # ===========================================================================
+
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${EnvironmentName}-alarms"
+      DisplayName: !Sub "WizTT ${EnvironmentName} Alarms"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alarms"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  MongoDBCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-mongodb-cpu-high"
+      AlarmDescription: >
+        MongoDB EC2 CPU utilization exceeded threshold.
+        May indicate: heavy query load, backup in progress, or
+        cryptomining activity if instance is compromised via SSH.
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref CPUAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !ImportValue
+            Fn::Sub: "${EnvironmentName}-MongoDBInstanceId"
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      OKActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  K8sMasterCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-k8s-master-cpu-high"
+      AlarmDescription: >
+        K8s Master CPU utilization exceeded threshold.
+        May indicate: excessive kubectl calls, etcd compaction,
+        controller-manager backlog, or API server overload.
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref CPUAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !ImportValue
+            Fn::Sub: "${EnvironmentName}-K8sMasterInstanceId"
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      OKActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  K8sWorkerCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-k8s-worker-cpu-high"
+      AlarmDescription: >
+        K8s Worker CPU utilization exceeded threshold.
+        May indicate: Tasky application under high load,
+        container image pull in progress, or runaway pod.
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref CPUAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !ImportValue
+            Fn::Sub: "${EnvironmentName}-K8sWorkerInstanceId"
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      OKActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WAFBlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-waf-blocked-requests-high"
+      AlarmDescription: >
+        WAF blocked request count exceeded threshold in 5-minute window.
+        May indicate: active web attack (SQLi, XSS), vulnerability scanner,
+        or DDoS attempt.
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref WAFBlockedRequestThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: WebACL
+          Value: !Sub "${EnvironmentName}-web-acl"
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: ALL
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  RootAccountUsageFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterName: !Sub "${EnvironmentName}-root-account-usage"
+      FilterPattern: >-
+        { $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS
+        && $.eventType != "AwsServiceEvent" }
+      MetricTransformations:
+        - MetricName: RootAccountUsage
+          MetricNamespace: !Sub "WizTT/${EnvironmentName}/Security"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  RootAccountUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-root-account-usage"
+      AlarmDescription: >
+        CRITICAL: Root account API call detected.
+        Root account usage is a critical security finding.
+        Immediate investigation required - potential account compromise.
+      MetricName: RootAccountUsage
+      Namespace: !Sub "WizTT/${EnvironmentName}/Security"
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  UnauthorizedAPICallsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterName: !Sub "${EnvironmentName}-unauthorized-api-calls"
+      FilterPattern: >-
+        { ($.errorCode = "AccessDenied") ||
+        ($.errorCode = "UnauthorizedOperation") }
+      MetricTransformations:
+        - MetricName: UnauthorizedAPICalls
+          MetricNamespace: !Sub "WizTT/${EnvironmentName}/Security"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  UnauthorizedAPICallsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-unauthorized-api-calls"
+      AlarmDescription: >
+        Spike in unauthorized AWS API calls detected.
+        May indicate: compromised credentials being used, application
+        misconfiguration, or attacker attempting privilege escalation.
+      MetricName: UnauthorizedAPICalls
+      Namespace: !Sub "WizTT/${EnvironmentName}/Security"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  IAMPolicyChangesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterName: !Sub "${EnvironmentName}-iam-policy-changes"
+      FilterPattern: >-
+        { ($.eventName = DeleteGroupPolicy) ||
+        ($.eventName = DeleteRolePolicy) ||
+        ($.eventName = DeleteUserPolicy) ||
+        ($.eventName = PutGroupPolicy) ||
+        ($.eventName = PutRolePolicy) ||
+        ($.eventName = PutUserPolicy) ||
+        ($.eventName = CreatePolicy) ||
+        ($.eventName = DeletePolicy) ||
+        ($.eventName = CreatePolicyVersion) ||
+        ($.eventName = DeletePolicyVersion) ||
+        ($.eventName = SetDefaultPolicyVersion) ||
+        ($.eventName = AttachRolePolicy) ||
+        ($.eventName = DetachRolePolicy) ||
+        ($.eventName = AttachUserPolicy) ||
+        ($.eventName = DetachUserPolicy) }
+      MetricTransformations:
+        - MetricName: IAMPolicyChanges
+          MetricNamespace: !Sub "WizTT/${EnvironmentName}/Security"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  IAMPolicyChangesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-iam-policy-changes"
+      AlarmDescription: >
+        IAM policy modification detected outside of CloudFormation deployment.
+        May indicate privilege escalation attempt or unauthorized IAM changes.
+      MetricName: IAMPolicyChanges
+      Namespace: !Sub "WizTT/${EnvironmentName}/Security"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  EC2InstanceChangesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterName: !Sub "${EnvironmentName}-ec2-instance-changes"
+      FilterPattern: >-
+        { ($.eventName = RunInstances) ||
+        ($.eventName = RebootInstances) ||
+        ($.eventName = StartInstances) ||
+        ($.eventName = StopInstances) ||
+        ($.eventName = TerminateInstances) }
+      MetricTransformations:
+        - MetricName: EC2InstanceChanges
+          MetricNamespace: !Sub "WizTT/${EnvironmentName}/Security"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  EC2InstanceChangesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-ec2-instance-changes"
+      AlarmDescription: >
+        EC2 instance launch/stop/terminate detected.
+        IMPORTANT: MongoDB EC2 has ec2:* IAM permission (intentional weakness).
+        If MongoDB is compromised, an attacker could use instance metadata
+        credentials to RunInstances for crypto mining or lateral movement.
+      MetricName: EC2InstanceChanges
+      Namespace: !Sub "WizTT/${EnvironmentName}/Security"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # SECTION 4.4: CLOUDWATCH DASHBOARD
+  # ===========================================================================
+  WizTTDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${EnvironmentName}-dashboard"
+      DashboardBody:
+        Fn::Sub:
+          - |
+            {
+              "widgets": [
+                {
+                  "type": "text",
+                  "x": 0,
+                  "y": 0,
+                  "width": 24,
+                  "height": 1,
+                  "properties": {
+                    "markdown": "# WizTT Environment Dashboard | Region: ${AWS::Region} | Environment: ${EnvironmentName}"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 1,
+                  "width": 8,
+                  "height": 6,
+                  "properties": {
+                    "title": "EC2 CPU Utilization - All Instances",
+                    "metrics": [
+                      ["AWS/EC2", "CPUUtilization", "InstanceId", "${MongoDBId}", {"label": "MongoDB"}],
+                      ["AWS/EC2", "CPUUtilization", "InstanceId", "${K8sMasterId}", {"label": "K8s Master"}],
+                      ["AWS/EC2", "CPUUtilization", "InstanceId", "${K8sWorkerId}", {"label": "K8s Worker"}]
+                    ],
+                    "period": 300,
+                    "stat": "Average",
+                    "view": "timeSeries",
+                    "yAxis": {"left": {"min": 0, "max": 100}},
+                    "annotations": {
+                      "horizontal": [{"label": "Alarm threshold", "value": ${CPUAlarmThreshold}}]
+                    },
+                    "region": "${AWS::Region}"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 8,
+                  "y": 1,
+                  "width": 8,
+                  "height": 6,
+                  "properties": {
+                    "title": "WAF - Allowed vs Blocked Requests",
+                    "metrics": [
+                      ["AWS/WAFV2", "AllowedRequests", "WebACL", "${EnvironmentName}-web-acl", "Region", "${AWS::Region}", "Rule", "ALL", {"label": "Allowed", "color": "#2ca02c"}],
+                      ["AWS/WAFV2", "BlockedRequests", "WebACL", "${EnvironmentName}-web-acl", "Region", "${AWS::Region}", "Rule", "ALL", {"label": "Blocked", "color": "#d62728"}]
+                    ],
+                    "period": 300,
+                    "stat": "Sum",
+                    "view": "timeSeries",
+                    "region": "${AWS::Region}",
+                    "annotations": {
+                      "horizontal": []
+                    }
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 16,
+                  "y": 1,
+                  "width": 8,
+                  "height": 6,
+                  "properties": {
+                    "title": "Security Events - CloudTrail",
+                    "metrics": [
+                      ["WizTT/${EnvironmentName}/Security", "UnauthorizedAPICalls", {"label": "Unauthorized API Calls", "color": "#ff7f0e"}],
+                      ["WizTT/${EnvironmentName}/Security", "IAMPolicyChanges", {"label": "IAM Policy Changes", "color": "#d62728"}],
+                      ["WizTT/${EnvironmentName}/Security", "RootAccountUsage", {"label": "Root Account Usage", "color": "#9467bd"}],
+                      ["WizTT/${EnvironmentName}/Security", "EC2InstanceChanges", {"label": "EC2 Instance Changes", "color": "#8c564b"}]
+                    ],
+                    "period": 300,
+                    "stat": "Sum",
+                    "view": "timeSeries",
+                    "region": "${AWS::Region}",
+                    "annotations": {
+                      "horizontal": []
+                    }
+                  }
+                },
+                {
+                  "type": "alarm",
+                  "x": 0,
+                  "y": 7,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "title": "Active Alarms",
+                    "alarms": [
+                      "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-mongodb-cpu-high",
+                      "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-k8s-master-cpu-high",
+                      "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-k8s-worker-cpu-high",
+                      "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-waf-blocked-requests-high",
+                      "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-root-account-usage",
+                      "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-unauthorized-api-calls",
+                      "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-iam-policy-changes",
+                      "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-ec2-instance-changes"
+                    ]
+                  }
+                },
+                {
+                  "type": "log",
+                  "x": 0,
+                  "y": 10,
+                  "width": 12,
+                  "height": 6,
+                  "properties": {
+                    "title": "MongoDB Backup Status (Last 24h)",
+                    "query": "SOURCE '/aws/ec2/mongodb' | fields @timestamp, @message | filter @logStream like /backup/ | filter @message like /completed|ERROR/ | sort @timestamp desc | limit 20",
+                    "region": "${AWS::Region}",
+                    "view": "table"
+                  }
+                },
+                {
+                  "type": "log",
+                  "x": 12,
+                  "y": 10,
+                  "width": 12,
+                  "height": 6,
+                  "properties": {
+                    "title": "MongoDB SSH Login Attempts (Last 24h)",
+                    "query": "SOURCE '/aws/ec2/mongodb' | fields @timestamp, @message | filter @logStream like /secure/ | filter @message like /Failed password|Accepted password|Invalid user/ | sort @timestamp desc | limit 20",
+                    "region": "${AWS::Region}",
+                    "view": "table"
+                  }
+                }
+              ]
+            }
+          - MongoDBId: !ImportValue
+              Fn::Sub: "${EnvironmentName}-MongoDBInstanceId"
+            K8sMasterId: !ImportValue
+              Fn::Sub: "${EnvironmentName}-K8sMasterInstanceId"
+            K8sWorkerId: !ImportValue
+              Fn::Sub: "${EnvironmentName}-K8sWorkerInstanceId"
+
+  # ===========================================================================
+  # SECTION 4.5: AWS WAF v2 WEB ACL
+  # ===========================================================================
+  WizTTWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${EnvironmentName}-web-acl"
+      Description: WAF Web ACL protecting the Tasky application via ALB. Implements rate limiting, OWASP Top 10 protections, known bad input filtering, and SQLi protection.
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${EnvironmentName}-web-acl"
+      Rules:
+        - Name: RateLimitRule
+          Priority: 10
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${EnvironmentName}-rate-limit"
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref WAFRateLimitThreshold
+              AggregateKeyType: IP
+
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 20
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${EnvironmentName}-common-rules"
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              RuleActionOverrides:
+                - Name: SizeRestrictions_BODY
+                  ActionToUse:
+                    Count: {}
+
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 30
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${EnvironmentName}-known-bad-inputs"
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 40
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${EnvironmentName}-sqli-rules"
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-web-acl"
+        - Key: Purpose
+          Value: "WAF-ALB-Protection"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WAFLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WizTTWebACL.Arn
+      LogDestinationConfigs:
+        - !GetAtt WAFLogGroup.Arn
+      LoggingFilter:
+        DefaultBehavior: DROP
+        Filters:
+          - Behavior: KEEP
+            Conditions:
+              - ActionCondition:
+                  Action: BLOCK
+            Requirement: MEETS_ANY
+
+  # ===========================================================================
+  # SECTION 4.6: AMAZON GUARDDUTY
+  # ===========================================================================
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Condition: GuardDutyEnabled
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      Features:
+        - Name: S3_DATA_EVENTS
+          Status: ENABLED
+        - Name: EBS_MALWARE_PROTECTION
+          Status: ENABLED
+        - Name: EKS_AUDIT_LOGS
+          Status: DISABLED
+        - Name: RDS_LOGIN_EVENTS
+          Status: DISABLED
+        - Name: RUNTIME_MONITORING
+          Status: DISABLED
+        - Name: LAMBDA_NETWORK_LOGS
+          Status: DISABLED
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-guardduty"
+        - Key: Purpose
+          Value: "Threat-Detection"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # SECTION 4.7: ROUTE 53 - PRIVATE HOSTED ZONE
+  # ===========================================================================
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref InternalDomainName
+      HostedZoneConfig:
+        Comment: !Sub >
+          WizTT private hosted zone for ${InternalDomainName}.
+          Accessible within VPC only. Used for internal service discovery.
+          mongodb.internal.wizdemo.ca resolves to MongoDB private IP.
+      VPCs:
+        - VPCId: !ImportValue
+            Fn::Sub: "${EnvironmentName}-VPCId"
+          VPCRegion: !Ref AWS::Region
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-hz"
+        - Key: Purpose
+          Value: "Internal-DNS-Service-Discovery"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  MongoDBDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Sub "mongodb.${InternalDomainName}"
+      Type: A
+      TTL: 60
+      Comment: >
+        MongoDB EC2 private IP address.
+        Used by Tasky pods via MONGODB_URI environment variable.
+      ResourceRecords:
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-MongoDBPrivateIP"
+
+  # ===========================================================================
+  # SECTION 4.8: ACM CERTIFICATE
+  # ===========================================================================
+  TaskyACMCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub "${AppSubdomain}.${RootDomainName}"
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Sub "${AppSubdomain}.${RootDomainName}"
+          HostedZoneId: !Ref PublicHostedZoneId
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-tasky-cert"
+        - Key: Purpose
+          Value: "TLS-Certificate-Tasky-ALB"
+        - Key: Domain
+          Value: !Sub "${AppSubdomain}.${RootDomainName}"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # SECTION 4.9: AWS CONFIG
+  # ===========================================================================
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Condition: AWSConfigEnabled
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-config-role"
+      Description: >
+        Allows AWS Config to read resource configurations,
+        deliver configuration snapshots to S3, and publish
+        notifications to SNS.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-config-s3-delivery"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub
+                  - "${BucketArn}/AWSLogs/${AWS::AccountId}/Config/*"
+                  - BucketArn: !ImportValue
+                      Fn::Sub: "${EnvironmentName}-CloudTrailLogsBucketArn"
+                Condition:
+                  StringEquals:
+                    s3:x-amz-acl: bucket-owner-full-control
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                Resource: !ImportValue
+                  Fn::Sub: "${EnvironmentName}-CloudTrailLogsBucketArn"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-config-role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Condition: AWSConfigEnabled
+    Properties:
+      Name: !Sub "${EnvironmentName}-recorder"
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+        RecordingStrategy:
+          UseOnly: ALL_SUPPORTED_RESOURCE_TYPES
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Condition: AWSConfigEnabled
+    Properties:
+      Name: !Sub "${EnvironmentName}-delivery-channel"
+      S3BucketName: !ImportValue
+        Fn::Sub: "${EnvironmentName}-CloudTrailLogsBucketName"
+      SnsTopicARN: !Ref AlarmNotificationTopic
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  ConfigRuleS3PublicRead:
+    Type: AWS::Config::ConfigRule
+    Condition: AWSConfigEnabled
+    DependsOn: ConfigDeliveryChannel
+    Properties:
+      ConfigRuleName: !Sub "${EnvironmentName}-s3-bucket-public-read-prohibited"
+      Description: >
+        Checks that S3 buckets do not allow public read access.
+        Expected NON_COMPLIANT: MongoDB backup bucket (intentional weakness).
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED
+
+  ConfigRuleS3PublicWrite:
+    Type: AWS::Config::ConfigRule
+    Condition: AWSConfigEnabled
+    DependsOn: ConfigDeliveryChannel
+    Properties:
+      ConfigRuleName: !Sub "${EnvironmentName}-s3-bucket-public-write-prohibited"
+      Description: >
+        Checks that S3 buckets do not allow public write access.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_WRITE_PROHIBITED
+
+  ConfigRuleS3SSLOnly:
+    Type: AWS::Config::ConfigRule
+    Condition: AWSConfigEnabled
+    DependsOn: ConfigDeliveryChannel
+    Properties:
+      ConfigRuleName: !Sub "${EnvironmentName}-s3-bucket-ssl-requests-only"
+      Description: >
+        Checks that S3 bucket policies require SSL for all requests.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SSL_REQUESTS_ONLY
+
+  ConfigRuleRestrictedSSH:
+    Type: AWS::Config::ConfigRule
+    Condition: AWSConfigEnabled
+    DependsOn: ConfigDeliveryChannel
+    Properties:
+      ConfigRuleName: !Sub "${EnvironmentName}-restricted-ssh"
+      Description: >
+        Checks that security groups do not allow unrestricted SSH access.
+        Expected NON_COMPLIANT: MongoDB SG allows 0.0.0.0/0 on port 22
+        (intentional weakness for the Wiz demo).
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+      Source:
+        Owner: AWS
+        SourceIdentifier: INCOMING_SSH_DISABLED
+
+  ConfigRuleIMDSv2:
+    Type: AWS::Config::ConfigRule
+    Condition: AWSConfigEnabled
+    DependsOn: ConfigDeliveryChannel
+    Properties:
+      ConfigRuleName: !Sub "${EnvironmentName}-ec2-imdsv2-check"
+      Description: >
+        Checks that EC2 instances use IMDSv2 (HttpTokens=required).
+        Expected NON_COMPLIANT: MongoDB EC2 uses IMDSv1 (intentional weakness).
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_IMDSV2_CHECK
+
+  ConfigRuleEncryptedVolumes:
+    Type: AWS::Config::ConfigRule
+    Condition: AWSConfigEnabled
+    DependsOn: ConfigDeliveryChannel
+    Properties:
+      ConfigRuleName: !Sub "${EnvironmentName}-encrypted-volumes"
+      Description: >
+        Checks that attached EBS volumes are encrypted at rest.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Volume
+      Source:
+        Owner: AWS
+        SourceIdentifier: ENCRYPTED_VOLUMES
+
+  ConfigRuleCloudTrailEnabled:
+    Type: AWS::Config::ConfigRule
+    Condition: AWSConfigEnabled
+    DependsOn: ConfigDeliveryChannel
+    Properties:
+      ConfigRuleName: !Sub "${EnvironmentName}-cloudtrail-enabled"
+      Description: >
+        Checks that CloudTrail is enabled in this region.
+      Source:
+        Owner: AWS
+        SourceIdentifier: CLOUD_TRAIL_CLOUD_WATCH_LOGS_ENABLED
+
+  ConfigRuleGuardDutyEnabled:
+    Type: AWS::Config::ConfigRule
+    Condition: AWSConfigEnabled
+    DependsOn: ConfigDeliveryChannel
+    Properties:
+      ConfigRuleName: !Sub "${EnvironmentName}-guardduty-enabled"
+      Description: >
+        Checks that GuardDuty is enabled in this account/region.
+      Source:
+        Owner: AWS
+        SourceIdentifier: GUARDDUTY_ENABLED_CENTRALIZED
+
+  # ===========================================================================
+  # SECTION 4.10: AMAZON MACIE
+  # ===========================================================================
+  MacieSession:
+    Type: AWS::Macie::Session
+    Condition: MacieEnabled
+    Properties:
+      Status: ENABLED
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+
+  # ===========================================================================
+  # SECTION 4.11: AWS SECURITY HUB
+  # ===========================================================================
+  SecurityHubHub:
+    Type: AWS::SecurityHub::Hub
+    Condition: SecurityHubEnabled
+    Properties:
+      AutoEnableControls: true
+      ControlFindingGenerator: SECURITY_CONTROL
+      EnableDefaultStandards: false
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  SecurityHubCIS14Standard:
+    Type: AWS::SecurityHub::Standard
+    Condition: SecurityHubEnabled
+    DependsOn: SecurityHubHub
+    Properties:
+      StandardsArn: !Sub "arn:${AWS::Partition}:securityhub:${AWS::Region}::standards/cis-aws-foundations-benchmark/v/1.4.0"
+
+  SecurityHubAFSBPStandard:
+    Type: AWS::SecurityHub::Standard
+    Condition: SecurityHubEnabled
+    DependsOn: SecurityHubHub
+    Properties:
+      StandardsArn: !Sub "arn:${AWS::Partition}:securityhub:${AWS::Region}::standards/aws-foundational-security-best-practices/v/1.0.0"
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+
+  AlarmNotificationTopicArn:
+    Description: "SNS Topic ARN for CloudWatch Alarm notifications"
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub "${EnvironmentName}-AlarmNotificationTopicArn"
+
+  CloudTrailLogGroupName:
+    Description: "CloudTrail CloudWatch Log Group Name"
+    Value: !Ref CloudTrailLogGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-CloudTrailLogGroupName"
+
+  WAFLogGroupName:
+    Description: "WAF CloudWatch Log Group Name (must start with aws-waf-logs-)"
+    Value: !Ref WAFLogGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-WAFLogGroupName"
+
+  MongoDBLogGroupName:
+    Description: "MongoDB CloudWatch Log Group Name"
+    Value: !Ref MongoDBLogGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBLogGroupName"
+
+  # K8s log group names are imported from Stack 3 - not outputs of this stack.
+  # Reference them via:
+  #   !ImportValue "${EnvironmentName}-K8sMasterLogGroupName"
+  #   !ImportValue "${EnvironmentName}-K8sWorkerLogGroupName"
+
+  DashboardURL:
+    Description: >
+      CloudWatch Dashboard URL. Open in AWS Console to view
+      environment health metrics and security events.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${EnvironmentName}-dashboard"
+    Export:
+      Name: !Sub "${EnvironmentName}-DashboardURL"
+
+  CloudTrailArn:
+    Description: "CloudTrail Trail ARN"
+    Value: !GetAtt WizTTCloudTrail.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-CloudTrailArn"
+
+  WAFWebACLArn:
+    Description: >
+      WAF Web ACL ARN - imported by Stack 5 (Application) to attach
+      to the Application Load Balancer.
+    Value: !GetAtt WizTTWebACL.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-WAFWebACLArn"
+
+  WAFWebACLId:
+    Description: "WAF Web ACL ID"
+    Value: !GetAtt WizTTWebACL.Id
+    Export:
+      Name: !Sub "${EnvironmentName}-WAFWebACLId"
+
+  GuardDutyDetectorId:
+    Description: "GuardDuty Detector ID (used in Wiz demo to correlate findings)"
+    Condition: GuardDutyEnabled
+    Value: !Ref GuardDutyDetector
+    Export:
+      Name: !Sub "${EnvironmentName}-GuardDutyDetectorId"
+
+  PublicHostedZoneId:
+    Description: "Route 53 Public Hosted Zone ID for wizdemo.ca (pre-created, passed as parameter)"
+    Value: !Ref PublicHostedZoneId
+    Export:
+      Name: !Sub "${EnvironmentName}-PublicHostedZoneId"
+
+  PrivateHostedZoneId:
+    Description: "Route 53 Private Hosted Zone ID for internal.wizdemo.ca"
+    Value: !Ref PrivateHostedZone
+    Export:
+      Name: !Sub "${EnvironmentName}-PrivateHostedZoneId"
+
+  MongoDBDNSName:
+    Description: >
+      MongoDB internal DNS name used in MONGODB_URI secret.
+      Resolves to MongoDB private IP within the VPC only.
+    Value: !Sub "mongodb.${InternalDomainName}"
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBDNSName"
+
+  ACMCertificateArn:
+    Description: >
+      ACM Certificate ARN for tasky.wizdemo.ca.
+      Imported by Stack 5 (Application) for ALB HTTPS listener.
+    Value: !Ref TaskyACMCertificate
+    Export:
+      Name: !Sub "${EnvironmentName}-ACMCertificateArn"
+
+  ApplicationURL:
+    Description: "Tasky application URL (live after Stack 5 deployment)"
+    Value: !Sub "https://${AppSubdomain}.${RootDomainName}"
+    Export:
+      Name: !Sub "${EnvironmentName}-ApplicationURL"
+
+  ConfigRecorderName:
+    Condition: AWSConfigEnabled
+    Description: "AWS Config configuration recorder name"
+    Value: !Ref ConfigRecorder
+    Export:
+      Name: !Sub "${EnvironmentName}-ConfigRecorderName"
+
+  MacieStatus:
+    Condition: MacieEnabled
+    Description: "Amazon Macie status for this account/region"
+    Value: ENABLED
+    Export:
+      Name: !Sub "${EnvironmentName}-MacieStatus"
+
+  SecurityHubArn:
+    Condition: SecurityHubEnabled
+    Description: "AWS Security Hub Hub ARN"
+    Value: !Ref SecurityHubHub
+    Export:
+      Name: !Sub "${EnvironmentName}-SecurityHubArn"

@@ -1,0 +1,808 @@
+# =============================================================================
+# WizTT - Stack 0: Bootstrap
+# =============================================================================
+# Description:
+#   Deploys the bootstrap infrastructure required to run the IaC pipeline
+#   that manages WizTT CloudFormation Stacks 1-5.
+#
+#   This stack is deployed MANUALLY once before the IaC pipeline takes over
+#   management of the remaining stacks.
+#
+# Resources Created:
+#   - S3: Pipeline artifact bucket (shared with Stack 5 App pipeline)
+#   - IAM: CodePipeline service role (IaC pipeline only)
+#   - IAM: CloudFormation execution role (used by CF to deploy Stacks 1-5)
+#   - IAM: CodeBuild service role (IaC scan project only)
+#   - CodeBuild: IaC linting & validation project
+#   - CodePipeline: IaC pipeline (deploys Stacks 1-5 in order)
+#
+# Deployment:
+#   aws cloudformation deploy \
+#     --template-file cloudformation/0-bootstrap.yaml \
+#     --stack-name demo-bootstrap \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides DeveloperName="Your Name"
+#
+# Author:          [Your Name]
+# Last Updated:    2026-03-13
+# Version:         1.0.0
+# =============================================================================
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  WizTT Stack 0 - Bootstrap.
+  Deploys the IaC CI/CD pipeline infrastructure (S3 artifact bucket,
+  IAM roles, CodeBuild scanning project, and CodePipeline) used to
+  deploy and manage WizTT CloudFormation Stacks 1-5.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - EnvironmentName
+          - ProjectName
+      - Label:
+          default: "CI/CD Pipeline Configuration"
+        Parameters:
+          - GitHubConnectionArn
+          - GitHubOwner
+          - GitHubRepoName
+          - GitHubBranchName
+          - DeveloperName
+
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      GitHubConnectionArn:
+        default: "AWS CodeStar GitHub Connection ARN"
+      GitHubOwner:
+        default: "GitHub Repository Owner (username or org)"
+      GitHubRepoName:
+        default: "GitHub Repository Name"
+      GitHubBranchName:
+        default: "GitHub Branch to Deploy From"
+      DeveloperName:
+        default: "Developer Name (for wizexercise.txt)"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: demo
+    AllowedValues:
+      - demo
+      - dev
+      - staging
+      - prod
+    Description: >
+      Environment name used as a prefix for all resource names and
+      cross-stack export names. Must be consistent across all stacks.
+
+  ProjectName:
+    Type: String
+    Default: WizTT
+    Description: Project name for resource tagging.
+
+  GitHubConnectionArn:
+    Type: String
+    Default: "arn:aws:codeconnections:us-west-2:390403859369:connection/82d73114-de3d-4be6-afbd-3cef3e0c3a5a"
+    Description: >
+      ARN of the AWS CodeConnections connection to GitHub.
+      Created manually via AWS Console (Developer Tools > Connections).
+    AllowedPattern: '^arn:aws:codeconnections:.*'
+    ConstraintDescription: "Must be a valid CodeConnections connection ARN"
+
+  GitHubOwner:
+    Type: String
+    Default: "4sb8"
+    Description: GitHub username or organization that owns the repository.
+
+  GitHubRepoName:
+    Type: String
+    Default: "tasky"
+    Description: >
+      GitHub repository name containing both the application code
+      and the infrastructure CloudFormation templates.
+
+  GitHubBranchName:
+    Type: String
+    Default: "main"
+    Description: GitHub branch that triggers pipeline execution on push.
+
+  DeveloperName:
+    Type: String
+    Description: >
+      Developer full name to be injected into wizexercise.txt
+      inside the Tasky container image at build time.
+      Passed via --parameter-overrides at bootstrap deploy time,
+      then forwarded to Stack 5 by the IaC pipeline.
+    MinLength: 2
+    MaxLength: 100
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Section 0.1: Pipeline Artifact Bucket
+  # ---------------------------------------------------------------------------
+  # S3 bucket for CodePipeline artifact storage between pipeline stages.
+  # Shared with Stack 5 App pipeline - exported for cross-stack reference.
+  # Private, encrypted, versioning enabled (required by CodePipeline).
+  # ---------------------------------------------------------------------------
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-pipeline-artifacts-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-pipeline-artifacts"
+        - Key: Purpose
+          Value: "CodePipeline-Artifact-Store"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 0.2: CodePipeline IAM Role (IaC pipeline only)
+  # ---------------------------------------------------------------------------
+  # Scoped to IaC pipeline actions only:
+  #   - S3 artifact bucket access
+  #   - GitHub connection
+  #   - IaCCodeBuildProject execution
+  #   - CloudFormation stack management (Stacks 1-5)
+  #   - PassRole to CloudFormationExecutionRole
+  # The App pipeline in Stack 5 uses its own separate CodePipeline role.
+  # ---------------------------------------------------------------------------
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-iac-codepipeline-role"
+      Description: >
+        Service role for the IaC CodePipeline only. Grants access to S3
+        artifacts, IaC CodeBuild project execution, CloudFormation stack
+        management for Stacks 1-5, and the GitHub CodeStar connection.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-iac-codepipeline-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3ArtifactAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub "${PipelineArtifactBucket.Arn}/*"
+              - Sid: CodeConnectionsAccess
+                Effect: Allow
+                Action:
+                  - codeconnections:UseConnection
+                  - codestar-connections:UseConnection
+                Resource: !Ref GitHubConnectionArn
+              - Sid: CodeBuildAccess
+                Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                Resource: !GetAtt IaCCodeBuildProject.Arn
+              - Sid: CloudFormationAccess
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${EnvironmentName}-*"
+              - Sid: IAMPassRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt CloudFormationExecutionRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-iac-codepipeline-role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 0.3: CloudFormation Execution Role
+  # ---------------------------------------------------------------------------
+  # Role assumed by CloudFormation when creating/updating Stacks 1-5
+  # via the IaC pipeline. Needs broad permissions to create all WizTT
+  # resources across networking, security, compute, observability, and
+  # application layers.
+  # Not used by the App pipeline (no CloudFormation deploy actions there).
+  # ---------------------------------------------------------------------------
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-cfn-execution-role"
+      Description: >
+        Role assumed by CloudFormation during IaC pipeline stack deployments.
+        Grants permissions to create/modify all WizTT infrastructure resources
+        across Stacks 1-5.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # PowerUserAccess scoped - CF needs broad permissions to manage
+        # VPC, EC2, IAM, S3, WAF, Route53, ACM, EKS, etc.
+        # In production, scope this more tightly per resource type.
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-cfn-iam-access"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: IAMAccess
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:TagRole
+                  - iam:TagPolicy
+                  - iam:TagInstanceProfile
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-cfn-execution-role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 0.4: CodeBuild IAM Role (IaC scan only)
+  # ---------------------------------------------------------------------------
+  # Scoped to the IaCCodeBuildProject (cfn-lint + cfn_nag scanning).
+  # Does not include SSM, Secrets Manager, or EC2/VPC permissions
+  # since the IaC scan project does not require them.
+  # The App pipeline CodeBuild projects in Stack 5 use their own role.
+  # ---------------------------------------------------------------------------
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-iac-codebuild-role"
+      Description: >
+        Service role for the IaC CodeBuild scan project only.
+        Grants S3 artifact access and CloudWatch Logs for build output.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-iac-codebuild-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogsAccess
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${EnvironmentName}-iac-lint-scan"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${EnvironmentName}-iac-lint-scan:*"
+              - Sid: S3ArtifactAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub "${PipelineArtifactBucket.Arn}/*"
+              - Sid: CloudFormationValidation
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:DescribeStacks
+                  - cloudformation:GetTemplateSummary
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-iac-codebuild-role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 0.5: CodeBuild Project - IaC Linting & Validation
+  # ---------------------------------------------------------------------------
+  # Runs cfn-lint and cfn_nag security scanning on all CloudFormation
+  # templates before they are deployed via the IaC pipeline.
+  # ---------------------------------------------------------------------------
+  IaCCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-iac-lint-scan"
+      Description: >
+        Lints and security-scans CloudFormation templates before deployment.
+        Tools: cfn-lint (syntax/best practices) + cfn_nag (security rules).
+        This is the pipeline security control for IaC scanning.
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          # =================================================================
+          # IaC Pipeline - Security Scanning Buildspec
+          # =================================================================
+          # Scans all CloudFormation templates for:
+          #   1. Syntax errors and best practice violations (cfn-lint)
+          #   2. Security misconfigurations (cfn_nag)
+          # Pipeline security control - blocks deployment on findings
+          # =================================================================
+          phases:
+            install:
+              runtime-versions:
+                python: 3.11
+              commands:
+                - echo "Installing IaC scanning tools..."
+                - pip install cfn-lint
+                - gem install cfn-nag
+                - echo "Tools installed successfully"
+                - cfn-lint --version
+                - cfn_nag --version
+            pre_build:
+              commands:
+                - echo "=== Pre-build - Discovering CloudFormation templates ==="
+                - |
+                  CF_TEMPLATES=$(find cloudformation/ -name "*.yaml" -o -name "*.yml" | sort)
+                  echo "Templates found:"
+                  echo "$CF_TEMPLATES"
+                  echo "$CF_TEMPLATES" > /tmp/cf_templates.txt
+            build:
+              commands:
+                - echo "=== Build - Running cfn-lint syntax validation ==="
+                - |
+                  LINT_FAILED=0
+                  while IFS= read -r template; do
+                    echo "Linting - $template"
+                    cfn-lint "$template" \
+                      --include-checks W \
+                      --format json \
+                      --output-file "/tmp/lint-$(basename $template).json" || LINT_FAILED=1
+                    if [ $? -ne 0 ]; then
+                      echo "LINT FAILURE - $template"
+                      cat "/tmp/lint-$(basename $template).json"
+                    else
+                      echo "LINT PASSED - $template"
+                    fi
+                  done < /tmp/cf_templates.txt
+                  if [ $LINT_FAILED -ne 0 ]; then
+                    echo "cfn-lint found errors - blocking deployment"
+                    exit 1
+                  fi
+                - echo "=== Build - Running cfn_nag security scanning ==="
+                - |
+                  cfn_nag_scan \
+                    --input-path cloudformation/ \
+                    --template-pattern '.*\.(yaml|yml)' \
+                    --deny-list-path cloudformation/cfn_nag_suppression.yml \
+                    --output-format json \
+                    | tee /tmp/cfn_nag_results.json
+                  FAILURE_COUNT=$(cat /tmp/cfn_nag_results.json | \
+                    python3 -c "import json,sys; d=json.load(sys.stdin); \
+                    print(sum(len(r.get('violations',[])) for r in d if r.get('type')=='VIOLATION'))" \
+                    2>/dev/null || echo "0")
+                  echo "cfn_nag violations found - $FAILURE_COUNT"
+                  if [ "$FAILURE_COUNT" -gt "0" ]; then
+                    echo "cfn_nag found security violations - review required"
+                    cat /tmp/cfn_nag_results.json
+                    exit 1
+                  fi
+                  echo "cfn_nag scan passed"
+            post_build:
+              commands:
+                - echo "=== IaC scanning completed successfully ==="
+                - echo "All CloudFormation templates passed lint and security scan"
+          artifacts:
+            files:
+              - cloudformation/**
+              - k8s/**
+              - '**/*'
+            discard-paths: no
+
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/${EnvironmentName}-iac-lint-scan"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-iac-lint-scan"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 0.6: IaC Pipeline
+  # ---------------------------------------------------------------------------
+  # Triggered on push to main branch affecting /cloudformation/ directory.
+  # Stages:
+  #   1. Source:  GitHub → S3 artifact
+  #   2. Scan:    cfn-lint + cfn_nag security scanning
+  #   3-7. Deploy: CloudFormation change sets for Stacks 1-5 in order
+  # ---------------------------------------------------------------------------
+  IaCPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${EnvironmentName}-iac-pipeline"
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      PipelineType: V2
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: GitHubSource
+            Push:
+              - Branches:
+                  Includes:
+                    - !Ref GitHubBranchName
+                FilePaths:
+                  Includes:
+                    - "cloudformation/**"
+      Stages:
+        # Stage 1: Source
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub "${GitHubOwner}/${GitHubRepoName}"
+                BranchName: !Ref GitHubBranchName
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: false
+              OutputArtifacts:
+                - Name: SourceCode
+              RunOrder: 1
+
+        # Stage 2: Security Scan
+        - Name: SecurityScan
+          Actions:
+            - Name: IaCScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref IaCCodeBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: ScannedTemplates
+              RunOrder: 1
+
+        # Stage 3: Deploy Stack 1 - Networking
+        - Name: DeployStack1Networking
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub "${EnvironmentName}-networking"
+                ChangeSetName: !Sub "${EnvironmentName}-networking-changeset"
+                TemplatePath: "ScannedTemplates::cloudformation/1-networking.yaml"
+                ParameterOverrides: !Sub |
+                  {
+                    "EnvironmentName": "${EnvironmentName}",
+                    "ProjectName": "${ProjectName}"
+                  }
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              InputArtifacts:
+                - Name: ScannedTemplates
+              RunOrder: 1
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub "${EnvironmentName}-networking"
+                ChangeSetName: !Sub "${EnvironmentName}-networking-changeset"
+              RunOrder: 2
+
+        # Stage 4: Deploy Stack 2 - Security
+        - Name: DeployStack2Security
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub "${EnvironmentName}-security"
+                ChangeSetName: !Sub "${EnvironmentName}-security-changeset"
+                TemplatePath: "ScannedTemplates::cloudformation/2-security.yaml"
+                ParameterOverrides: !Sub |
+                  {
+                    "EnvironmentName": "${EnvironmentName}",
+                    "ProjectName": "${ProjectName}"
+                  }
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              InputArtifacts:
+                - Name: ScannedTemplates
+              RunOrder: 1
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub "${EnvironmentName}-security"
+                ChangeSetName: !Sub "${EnvironmentName}-security-changeset"
+              RunOrder: 2
+
+        # Stage 5: Deploy Stack 3 - Compute
+        - Name: DeployStack3Compute
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub "${EnvironmentName}-compute"
+                ChangeSetName: !Sub "${EnvironmentName}-compute-changeset"
+                TemplatePath: "ScannedTemplates::cloudformation/3-compute.yaml"
+                ParameterOverrides: !Sub |
+                  {
+                    "EnvironmentName": "${EnvironmentName}",
+                    "ProjectName": "${ProjectName}"
+                  }
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              InputArtifacts:
+                - Name: ScannedTemplates
+              RunOrder: 1
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub "${EnvironmentName}-compute"
+                ChangeSetName: !Sub "${EnvironmentName}-compute-changeset"
+              RunOrder: 2
+
+        # Stage 6: Deploy Stack 4 - Observability & DNS
+        - Name: DeployStack4Observability
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub "${EnvironmentName}-observability"
+                ChangeSetName: !Sub "${EnvironmentName}-observability-changeset"
+                TemplatePath: "ScannedTemplates::cloudformation/4-observability.yaml"
+                ParameterOverrides: !Sub |
+                  {
+                    "EnvironmentName": "${EnvironmentName}",
+                    "ProjectName": "${ProjectName}",
+                    "PublicHostedZoneId": "Z03957671O888ICJ3G9HN"
+                  }
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              InputArtifacts:
+                - Name: ScannedTemplates
+              RunOrder: 1
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub "${EnvironmentName}-observability"
+                ChangeSetName: !Sub "${EnvironmentName}-observability-changeset"
+              RunOrder: 2
+
+        # Stage 7: Deploy Stack 5 - Application
+        # NOTE: Bootstrap resources have been removed from Stack 5.
+        # PipelineArtifactBucket, IAM roles, IaCCodeBuildProject, and
+        # IaCPipeline are all managed by this bootstrap stack (Stack 0).
+        - Name: DeployStack5Application
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub "${EnvironmentName}-application"
+                ChangeSetName: !Sub "${EnvironmentName}-application-changeset"
+                TemplatePath: "ScannedTemplates::cloudformation/5-application.yaml"
+                ParameterOverrides: !Sub |
+                  {
+                    "EnvironmentName": "${EnvironmentName}",
+                    "ProjectName": "${ProjectName}",
+                    "GitHubConnectionArn": "${GitHubConnectionArn}",
+                    "GitHubOwner": "${GitHubOwner}",
+                    "GitHubRepoName": "${GitHubRepoName}",
+                    "GitHubBranchName": "${GitHubBranchName}",
+                    "DeveloperName": "${DeveloperName}"
+                  }
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              InputArtifacts:
+                - Name: ScannedTemplates
+              RunOrder: 1
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub "${EnvironmentName}-application"
+                ChangeSetName: !Sub "${EnvironmentName}-application-changeset"
+              RunOrder: 2
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-iac-pipeline"
+        - Key: Purpose
+          Value: "Infrastructure-IaC-Deployment"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+
+  PipelineArtifactBucketName:
+    Description: "Pipeline artifact S3 bucket name - imported by Stack 5 App pipeline"
+    Value: !Ref PipelineArtifactBucket
+    Export:
+      Name: !Sub "${EnvironmentName}-PipelineArtifactBucketName"
+
+  PipelineArtifactBucketArn:
+    Description: "Pipeline artifact S3 bucket ARN - imported by Stack 5 App pipeline"
+    Value: !GetAtt PipelineArtifactBucket.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-PipelineArtifactBucketArn"
+
+  IaCPipelineURL:
+    Description: "IaC Pipeline URL in AWS Console"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${EnvironmentName}-iac-pipeline/view"
+    Export:
+      Name: !Sub "${EnvironmentName}-IaCPipelineURL"

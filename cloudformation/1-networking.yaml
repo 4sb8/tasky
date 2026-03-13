@@ -1,0 +1,1081 @@
+# =============================================================================
+# WizTT - Stack 1: VPC & Networking Foundation
+# =============================================================================
+# Description:
+#   Establishes the core network infrastructure for the demo environment.
+#   This is the foundational stack that must be deployed first, as all other
+#   stacks depend on the outputs exported from this template.
+#
+# Deployment Order: 1 of 5
+# Depends On:      None
+# Exports To:      Stack 2 (Security), Stack 3 (Compute), Stack 4 (Observability)
+#
+# Resources Created:
+#   - VPC with DNS support
+#   - 2 Public Subnets (ALB, MongoDB, NAT instance)
+#   - 2 Private Subnets (K8s x2)
+#   - Internet Gateway + VPC Attachment
+#   - NAT Instance (t3.micro, Amazon Linux 2023)
+#   - NAT Instance Security Group
+#   - NAT Instance IAM Role (SSM only - no custom permissions needed)
+#   - Elastic IP for NAT Instance
+#   - EIP Association (AWS native - not UserData)
+#   - Public Route Table + IGW Route + Subnet Associations
+#   - Private Route Tables x2 + NAT Routes (AWS native - not UserData)
+#   - S3 VPC Gateway Endpoint
+#   - VPC Flow Logs → CloudWatch Logs
+#
+# CI/CD Notes:
+#   - All sensitive parameters passed via pipeline parameter files
+#   - Outputs exported for cross-stack references in Stacks 2-5
+#   - Stack name convention: {EnvironmentName}-networking
+#
+# Last Updated:    2026-03-03
+# Version:         1.0.0
+# =============================================================================
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  WizTT Stack 1/5 - VPC and Networking Foundation.
+  Deploys core network infrastructure including VPC, subnets,
+  internet gateway, NAT instance (AL2023), route tables, S3 VPC
+  gateway endpoint, and VPC flow logs for the WizTT environment.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - EnvironmentName
+          - ProjectName
+      - Label:
+          default: "VPC Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+      - Label:
+          default: "NAT Instance Configuration"
+        Parameters:
+          - NATInstanceType
+          - NATInstanceAMI
+      - Label:
+          default: "VPC Flow Logs Configuration"
+        Parameters:
+          - FlowLogRetentionDays
+      
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      VpcCidr:
+        default: "VPC CIDR Block"
+      PublicSubnet1Cidr:
+        default: "Public Subnet 1 CIDR (us-west-2a)"
+      PublicSubnet2Cidr:
+        default: "Public Subnet 2 CIDR (us-west-2b)"
+      PrivateSubnet1Cidr:
+        default: "Private Subnet 1 CIDR (us-west-2a)"
+      PrivateSubnet2Cidr:
+        default: "Private Subnet 2 CIDR (us-west-2b)"
+      NATInstanceType:
+        default: "NAT Instance Type"
+      NATInstanceAMI:
+        default: "NAT Instance AMI (Amazon Linux 2023)"
+      FlowLogRetentionDays:
+        default: "VPC Flow Log Retention (Days)"
+
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  # ---------------------------------------------------------------------------
+  # Environment Configuration
+  # ---------------------------------------------------------------------------
+  EnvironmentName:
+    Type: String
+    Default: demo
+    AllowedValues:
+      - demo
+      - dev
+      - staging
+      - prod
+    Description: >
+      Environment identifier used as a prefix for all resource names
+      and exported output keys. Set via pipeline environment variables
+      to support multi-environment deployments without template changes.
+    ConstraintDescription: "Must be one of: demo, dev, staging, prod"
+
+  ProjectName:
+    Type: String
+    Default: WizTT
+    Description: >
+      Project name applied to all resources via the Project tag
+      for cost allocation and resource identification.
+
+  # ---------------------------------------------------------------------------
+  # VPC and Subnet CIDR Configuration
+  # ---------------------------------------------------------------------------
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >
+      CIDR block for the VPC. Default provides 65,536 IP addresses.
+      Must not overlap with on-premises networks if VPN is used.
+    ConstraintDescription: "Must be a valid IPv4 CIDR block (e.g. 10.0.0.0/16)"
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >
+      Public Subnet 1 in us-west-2a.
+      Purpose: ALB primary AZ. Also hosts the NAT instance.
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >
+      Public Subnet 2 in us-west-2b.
+      Purpose: ALB secondary AZ. Also hosts MongoDB.
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.11.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >
+      Private Subnet 1 in us-west-2a.
+      Purpose: Kubernetes Master and Worker nodes.
+      Outbound internet access via NAT instance in PublicSubnet1.
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.12.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >
+      Private Subnet 2 in us-west-2b.
+      Purpose: Required second AZ for ALB target group registration.
+      May host additional K8s nodes in future expansion.
+
+  # ---------------------------------------------------------------------------
+  # NAT Instance Configuration
+  # ---------------------------------------------------------------------------
+  NATInstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+    Description: >
+      EC2 instance type for NAT instance.
+
+  NATInstanceAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      AMI for the NAT instance. Resolves to latest Amazon Linux 2023
+      AMI in the deployment region via SSM Parameter Store at deploy time.
+
+  # ---------------------------------------------------------------------------
+  # VPC Flow Logs Configuration
+  # ---------------------------------------------------------------------------
+  FlowLogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues:
+      - 7
+      - 14
+      - 90
+      - 365
+      - 3650
+    Description: >
+      Retention period for VPC Flow Logs in CloudWatch Logs.
+  
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # SECTION 1.1: VPC
+  # ===========================================================================
+  # Core network container for all WizTT resources.
+  # EnableDnsSupport and EnableDnsHostnames required for:
+  #   - EC2 instances to resolve AWS service endpoints
+  #   - Route 53 private hosted zone resolution (Stack 4)
+  #   - SSM Session Manager connectivity
+  # ===========================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  # ===========================================================================
+  # SECTION 1.2: INTERNET GATEWAY
+  # ===========================================================================
+  # Required for public subnets to route traffic to/from the internet.
+  # Attached to VPC via separate VPCGatewayAttachment resource to allow
+  # CloudFormation to manage the attachment lifecycle independently.
+  # ===========================================================================
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-igw"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ===========================================================================
+  # SECTION 1.3: PUBLIC SUBNETS
+  # ===========================================================================
+  # Three public subnets across two AZs:
+  #   PublicSubnet1 (us-west-2a): ALB primary + NAT instance
+  #   PublicSubnet2 (us-west-2b): ALB secondary + MongoDB instance
+  #
+  # MapPublicIpOnLaunch: true ensures instances receive public IPs
+  # automatically on launch (required for MongoDB SSH exposure and
+  # NAT instance internet access).
+  #
+  # kubernetes.io/role/elb tag: required by AWS Load Balancer Controller
+  # to discover subnets eligible for internet-facing ALB placement.
+  # ===========================================================================
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicSubnet1"
+        - Key: Purpose
+          Value: "ALB-Primary+NAT"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: "kubernetes.io/role/elb"
+          Value: "1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicSubnet2"
+        - Key: Purpose
+          Value: "ALB-Secondary+MongoDB"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: "kubernetes.io/role/elb"
+          Value: "1"
+
+  # ===========================================================================
+  # SECTION 1.4: PRIVATE SUBNETS
+  # ===========================================================================
+  # Two private subnets for the Kubernetes cluster:
+  #   PrivateSubnet1 (us-west-2a): K8s Master + Worker nodes
+  #   PrivateSubnet2 (us-west-2b): ALB internal target group requirement
+  #
+  # No direct internet access. Outbound traffic routes via NAT instance.
+  #
+  # kubernetes.io/role/internal-elb tag: required by AWS Load Balancer
+  # Controller to discover subnets for internal ALB and NodePort target
+  # group registration.
+  # ===========================================================================
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateSubnet1"
+        - Key: Purpose
+          Value: "K8s Subnet"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: "kubernetes.io/role/internal-elb"
+          Value: "1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateSubnet2"
+        - Key: Purpose
+          Value: "K8s Subnet"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: "kubernetes.io/role/internal-elb"
+          Value: "1"
+
+  # ===========================================================================
+  # SECTION 1.5: PUBLIC ROUTE TABLE
+  # ===========================================================================
+  # Single route table shared by both public subnets.
+  # Default route (0.0.0.0/0) points to the Internet Gateway.
+  # ===========================================================================
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-rt"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ===========================================================================
+  # SECTION 1.6: NAT INSTANCE
+  # ===========================================================================
+  # NAT instance provides outbound internet access forprivate subnet  
+  # resources (K8s nodes pulling container images,accessing AWS APIs, etc.). 
+  # Note: NAT GW preferred but more expensive. Use NAT GW in Prod
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Section 1.6.1: NAT Instance Security Group
+  # ---------------------------------------------------------------------------
+  # Allows inbound traffic from private subnet CIDRs for NAT forwarding.
+  # Allows all outbound traffic to internet (required for NAT function).
+  #
+  # Description is kept short and uses only the allowed charset:
+  # a-zA-Z0-9 space ._-:/()#,@[]+=&;{}!$*
+  # Max 255 characters to avoid CF validation error.
+  # ---------------------------------------------------------------------------
+  NATInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-nat-sg"
+      GroupDescription: "NAT instance SG - allows inbound from private subnets for NAT forwarding and all outbound to internet"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: !Ref PrivateSubnet1Cidr
+          Description: "Allow all traffic from K8s private subnet 1 for NAT forwarding"
+        - IpProtocol: "-1"
+          CidrIp: !Ref PrivateSubnet2Cidr
+          Description: "Allow all traffic from K8s private subnet 2 for NAT forwarding"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: "Allow all outbound traffic to internet for NAT forwarding"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-nat-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 1.6.2: NAT Instance IAM Role
+  # ---------------------------------------------------------------------------
+  # Minimal role - only SSM Session Manager managed policy.
+  # ---------------------------------------------------------------------------
+  NATInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-nat-instance-role"
+      Description: "IAM role for NAT instance - SSM Session Manager access only"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-nat-instance-role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  NATInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-nat-instance-profile"
+      Roles:
+        - !Ref NATInstanceRole
+
+  # ---------------------------------------------------------------------------
+  # Section 1.6.3: NAT Instance Elastic IP
+  # ---------------------------------------------------------------------------
+  # Provides a stable public IP that persists across instance stop/start.
+  # ---------------------------------------------------------------------------
+  NATInstanceEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-nat-eip"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 1.6.4: NAT Instance EC2
+  # ---------------------------------------------------------------------------
+  # Amazon Linux 2023 - consistent with K8s Master and Worker nodes.
+  # SourceDestCheck: set to false as a CF property.
+  # UserData handles OS-level configuration.
+  # ---------------------------------------------------------------------------
+  NATInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      ImageId: !Ref NATInstanceAMI
+      InstanceType: !Ref NATInstanceType
+      SubnetId: !Ref PublicSubnet1
+      IamInstanceProfile: !Ref NATInstanceProfile
+      SourceDestCheck: false
+      SecurityGroupIds:
+        - !Ref NATInstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          # =================================================================
+          # NAT Instance UserData - OS Configuration Only
+          # =================================================================
+          # OS: Amazon Linux 2023
+
+          set -e
+          exec > >(tee /var/log/nat-setup.log) 2>&1
+
+          # Quick security updates only 
+          echo "=== Step 1: Applying OS updates ==="
+          dnf check-update -q || true  # Dry run, fast 
+          dnf update --security -y    # Security patches only`
+
+          # Enable IP forwarding
+          echo "=== Step 2: Enabling kernel IP forwarding ==="
+          dnf install nftables -y
+          systemctl enable --now nftables
+
+          echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+          sysctl -p
+
+          # Create complete NAT table
+          echo "=== Step 3: Configuring dnf NAT masquerading ==="
+          nft -- add table nat
+          nft -- add chain nat prerouting { type nat hook prerouting priority -100 \; }
+          nft add chain nat postrouting { type nat hook postrouting priority 100 \; }
+          nft add rule nat postrouting oifname "ens5" masquerade
+
+          # Persist rules
+          nft list ruleset > /etc/nftables.conf
+          
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-nat-instance"
+        - Key: Purpose
+          Value: "NAT-Instance"
+        - Key: OS
+          Value: "AmazonLinux2023"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 1.6.5: EIP Association
+  # ---------------------------------------------------------------------------
+  # Associates the pre-allocated EIP with the NAT instance.
+  # ---------------------------------------------------------------------------
+  NATInstanceEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt NATInstanceEIP.AllocationId
+      InstanceId: !Ref NATInstance
+
+  # ===========================================================================
+  # SECTION 1.7: PRIVATE ROUTE TABLES
+  # ===========================================================================
+  # Default route (0.0.0.0/0) points to NAT instance
+  # ===========================================================================
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-rt"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # Default NAT Routes for Private Subnets
+  # ---------------------------------------------------------------------------
+  # Points 0.0.0.0/0 to the NAT instance.
+  # ---------------------------------------------------------------------------
+  PrivateSubnetNATRoute:
+    Type: AWS::EC2::Route
+    DependsOn: NATInstanceEIPAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NATInstance
+
+  # ===========================================================================
+  # SECTION 1.8: S3 VPC GATEWAY ENDPOINT
+  # ===========================================================================
+  # Free gateway endpoint keeping S3 traffic within AWS network.
+  # Applied to all route tables so all subnets benefit:
+  #   - Public route table:    MongoDB EC2 backup to S3 (direct, no NAT)
+  #   - Private route table 1: K8s nodes to S3 (direct, no NAT)
+  #   - Private route table 2: K8s secondary subnet to S3 (direct, no NAT)
+  #
+  # Endpoint policy scoped to environment-prefixed buckets.
+  # ===========================================================================
+  S3VPCGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAllS3ThroughEndpoint
+            Effect: Allow
+            Principal: "*"
+            Action: "s3:*"
+            Resource: "*"
+
+  # ===========================================================================
+  # SECTION 1.8b: SSM SESSION MANAGER VPC INTERFACE ENDPOINTS
+  # ===========================================================================
+  # Enables SSM Session Manager connectivity for ALL instances (public and
+  # private subnets) without requiring traffic to traverse the internet.
+  #
+  # Endpoints deployed:
+  #   ssm          - Core SSM API (agent registration, heartbeat,
+  #                  Parameter Store API calls)
+  #   ssmmessages  - Session Manager data channel (interactive sessions,
+  #                  SSH and RDP tunneling, port forwarding)
+  #   ec2messages  - SSM Agent message relay (Run Command, Patch Manager,
+  #                  State Manager, Inventory)
+  #   kms          - KMS encryption for sessions and Parameter Store
+  #                  SecureString parameters
+  #   logs         - CloudWatch Logs delivery for session and agent logs
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Section 1.8b.1: SSM Endpoints Security Group
+  # ---------------------------------------------------------------------------
+  SSMEndpointsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-ssm-endpoints-sg"
+      GroupDescription: "SSM VPC Interface Endpoints SG - allows HTTPS from VPC CIDR only"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: "Allow HTTPS from entire VPC CIDR for SSM Agent connectivity"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ssm-endpoints-sg"
+        - Key: Purpose
+          Value: "SSM-VPC-Endpoints"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 1.8b.2: com.amazonaws.{region}.ssm
+  # ---------------------------------------------------------------------------
+  SSMInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref SSMEndpointsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ssm-endpoint"
+        - Key: Purpose
+          Value: "SSM-VPC-Endpoint"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 1.8b.3: com.amazonaws.{region}.ssmmessages
+  # ---------------------------------------------------------------------------
+  SSMMessagesInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref SSMEndpointsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ssmmessages-endpoint"
+        - Key: Purpose
+          Value: "SSM-VPC-Endpoint"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 1.8b.4: com.amazonaws.{region}.ec2messages
+  # ---------------------------------------------------------------------------
+  EC2MessagesInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref SSMEndpointsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ec2messages-endpoint"
+        - Key: Purpose
+          Value: "SSM-VPC-Endpoint"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 1.8b.5: com.amazonaws.{region}.kms
+  # ---------------------------------------------------------------------------
+  KMSInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.kms"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref SSMEndpointsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-kms-endpoint"
+        - Key: Purpose
+          Value: "SSM-KMS-VPC-Endpoint"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 1.8b.6: com.amazonaws.{region}.logs
+  # ---------------------------------------------------------------------------
+  CloudWatchLogsInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref SSMEndpointsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-logs-endpoint"
+        - Key: Purpose
+          Value: "SSM-Logs-VPC-Endpoint"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # SECTION 1.9: VPC FLOW LOGS
+  # ===========================================================================
+  # Captures ALL IP traffic (ACCEPT and REJECT) for the VPC.
+  # Delivered to CloudWatch Logs for:
+  #   - Security analysis (port scans, unusual traffic patterns)
+  #   - GuardDuty data source (threat detection)
+  #   - Network troubleshooting
+  #   - Compliance and audit requirements
+  # ===========================================================================
+  VPCFlowLogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/vpc/flowlogs/${EnvironmentName}"
+      RetentionInDays: !Ref FlowLogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc-flowlogs"
+        - Key: Purpose
+          Value: "VPC-Flow-Logs"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-vpc-flowlogs-role"
+      Description: "Allows VPC Flow Logs service to deliver logs to CloudWatch"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-vpc-flowlogs-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt VPCFlowLogsLogGroup.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc-flowlogs-role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogsLogGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      LogFormat: '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${subnet-id} ${instance-id} ${tcp-flags} ${pkt-srcaddr} ${pkt-dstaddr}'
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc-flow-log"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+
+  # ---------------------------------------------------------------------------
+  # VPC
+  # ---------------------------------------------------------------------------
+  VPCId:
+    Description: "VPC ID - referenced by all stacks for resource placement"
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${EnvironmentName}-VPCId"
+
+  VPCCidr:
+    Description: "VPC CIDR block - used in Security Group rules"
+    Value: !GetAtt VPC.CidrBlock
+    Export:
+      Name: !Sub "${EnvironmentName}-VPCCidr"
+
+  # ---------------------------------------------------------------------------
+  # Public Subnets
+  # ---------------------------------------------------------------------------
+  PublicSubnet1Id:
+    Description: "Public Subnet 1 ID (us-west-2a) - ALB primary + NAT instance"
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub "${EnvironmentName}-PublicSubnet1Id"
+
+  PublicSubnet2Id:
+    Description: "Public Subnet 2 ID (us-west-2b) - ALB secondary AZ"
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub "${EnvironmentName}-PublicSubnet2Id"
+
+  # ---------------------------------------------------------------------------
+  # Private Subnets
+  # ---------------------------------------------------------------------------
+  PrivateSubnet1Id:
+    Description: "Private Subnet 1 ID (us-west-2a) - K8s Master + Worker"
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub "${EnvironmentName}-PrivateSubnet1Id"
+
+  PrivateSubnet2Id:
+    Description: "Private Subnet 2 ID (us-west-2b) - K8s secondary + ALB"
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub "${EnvironmentName}-PrivateSubnet2Id"
+
+  # ---------------------------------------------------------------------------
+  # NAT Instance
+  # ---------------------------------------------------------------------------
+  NATInstanceId:
+    Description: "NAT Instance ID"
+    Value: !Ref NATInstance
+    Export:
+      Name: !Sub "${EnvironmentName}-NATInstanceId"
+
+  NATInstancePublicIP:
+    Description: "NAT Instance Elastic IP - use as AdminCidrIp in Stack 2"
+    Value: !Ref NATInstanceEIP
+    Export:
+      Name: !Sub "${EnvironmentName}-NATInstancePublicIP"
+
+  NATInstanceEIPAllocationId:
+    Description: "NAT Instance EIP Allocation ID"
+    Value: !GetAtt NATInstanceEIP.AllocationId
+    Export:
+      Name: !Sub "${EnvironmentName}-NATInstanceEIPAllocationId"
+
+  NATInstanceSecurityGroupId:
+    Description: "NAT Instance Security Group ID"
+    Value: !Ref NATInstanceSecurityGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-NATInstanceSGId"
+
+  # ---------------------------------------------------------------------------
+  # Route Tables
+  # ---------------------------------------------------------------------------
+  PublicRouteTableId:
+    Description: "Public Route Table ID"
+    Value: !Ref PublicRouteTable
+    Export:
+      Name: !Sub "${EnvironmentName}-PublicRouteTableId"
+
+  PrivateRouteTableId:
+    Description: "Private Route Table ID"
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub "${EnvironmentName}-PrivateRouteTableId"
+
+  # ---------------------------------------------------------------------------
+  # VPC Endpoint
+  # ---------------------------------------------------------------------------
+  S3VPCEndpointId:
+    Description: "S3 VPC Gateway Endpoint ID"
+    Value: !Ref S3VPCGatewayEndpoint
+    Export:
+      Name: !Sub "${EnvironmentName}-S3VPCEndpointId"
+  
+  EC2MessagesVPCEndpointId:
+    Description: "EC2 Messages VPC Interface Endpoint ID"
+    Value: !Ref EC2MessagesInterfaceEndpoint
+    Export:
+      Name: !Sub "${EnvironmentName}-EC2MessagesVPCEndpointId"
+
+  SSMVPCEndpointId:
+    Description: "SSM VPC Interface Endpoint ID"
+    Value: !Ref SSMInterfaceEndpoint
+    Export:
+      Name: !Sub "${EnvironmentName}-SSMVPCEndpointId"
+
+  LogsVPCEndpointId:
+    Description: "CloudWatch Logs VPC Interface Endpoint ID"
+    Value: !Ref CloudWatchLogsInterfaceEndpoint
+    Export:
+      Name: !Sub "${EnvironmentName}-LogsVPCEndpointId"
+
+  SSMMessagesVPCEndpointId:
+    Description: "SSM Messages VPC Interface Endpoint ID"
+    Value: !Ref SSMMessagesInterfaceEndpoint
+    Export:
+      Name: !Sub "${EnvironmentName}-SSMMessagesVPCEndpointId"
+
+  KMSVPCEndpointId:
+    Description: "KMS VPC Interface Endpoint ID"
+    Value: !Ref KMSInterfaceEndpoint
+    Export:
+      Name: !Sub "${EnvironmentName}-KMSVPCEndpointId"
+
+  # ---------------------------------------------------------------------------
+  # VPC Flow Logs
+  # ---------------------------------------------------------------------------
+  VPCFlowLogsLogGroupName:
+    Description: "VPC Flow Logs CloudWatch Log Group Name"
+    Value: !Ref VPCFlowLogsLogGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-VPCFlowLogsLogGroupName"
+
+  VPCFlowLogsLogGroupArn:
+    Description: "VPC Flow Logs CloudWatch Log Group ARN"
+    Value: !GetAtt VPCFlowLogsLogGroup.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-VPCFlowLogsLogGroupArn"

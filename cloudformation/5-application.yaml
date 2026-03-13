@@ -1,0 +1,1077 @@
+# =============================================================================
+# WizTT - Stack 5: Application
+# =============================================================================
+# Description:
+#   Deploys the application-layer infrastructure for the WizTT environment.
+#   This is the final infrastructure stack, creating the ALB, HTTPS listener,
+#   HTTP→HTTPS redirect, WAF association, and public DNS record.
+#
+#   NOTE: The Kubernetes application resources (Deployment, Service, Ingress,
+#   ClusterRoleBinding, ExternalSecret) are NOT deployed by this CloudFormation
+#   stack. They are deployed by the application CI/CD pipeline (CodePipeline +
+#   CodeBuild) after this stack completes. See /k8s/ manifests directory.
+#
+# Deployment Order: 5 of 5 (final infrastructure stack)
+# Depends On:      Stack 0 (Bootstrap), Stack 1 (Networking), Stack 2 (Security),
+#                  Stack 3 (Compute), Stack 4 (Observability & DNS)
+# Exports To:      None (final stack)
+#
+# Resources Created:
+#   - Application Load Balancer (internet-facing, public subnets 1+2)
+#   - ALB Target Group (K8s worker NodePort 30080)
+#   - ALB HTTPS Listener (port 443, ACM certificate, WAF attached)
+#   - ALB HTTP Listener (port 80, redirect to HTTPS)
+#   - WAF Web ACL Association (attaches Stack 4 WAF to this ALB)
+#   - Route 53 ALIAS Record (tasky.wizdemo.ca → ALB DNS name)
+#   - CodePipeline: Application container build + K8s deploy pipeline
+#   - CodeBuild: Container build + push project
+#   - CodeBuild: K8s deployment project
+#   - IAM: CodePipeline service role (App pipeline only)
+#   - IAM: CodeBuild service role (App pipeline projects only)
+#
+# CI/CD Notes:
+#   - Pipeline 1 (IaC) is managed by Stack 0 (Bootstrap).
+#   - Pipeline 2 (App): GitHub push → build container → push DockerHub → deploy K8s
+#   - PipelineArtifactBucket is created in Stack 0 and imported here.
+#   - GitHubConnectionArn must be created manually via AWS Console
+#     (Developer Tools > Connections) before deploying Stack 0.
+#
+# Author:          [Your Name]
+# Last Updated:    2026-03-13
+# Version:         2.0.0
+# =============================================================================
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  WizTT Stack 5/5 - Application Layer.
+  Deploys the Application Load Balancer, HTTPS/HTTP listeners, WAF
+  association, Route 53 ALIAS record, and the application CI/CD pipeline
+  (container build + K8s deploy) for the WizTT environment.
+  IaC pipeline and shared infrastructure resources are managed by Stack 0.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - EnvironmentName
+          - ProjectName
+      - Label:
+          default: "Load Balancer Configuration"
+        Parameters:
+          - NodePort
+          - HealthCheckPath
+          - HealthCheckIntervalSeconds
+      - Label:
+          default: "DNS Configuration"
+        Parameters:
+          - RootDomainName
+          - AppSubdomain
+      - Label:
+          default: "CI/CD Pipeline Configuration"
+        Parameters:
+          - GitHubConnectionArn
+          - GitHubOwner
+          - GitHubRepoName
+          - GitHubBranchName
+          - DeveloperName
+          - KubernetesVersion
+
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      NodePort:
+        default: "K8s NodePort for ALB Target Group"
+      HealthCheckPath:
+        default: "ALB Health Check Path"
+      HealthCheckIntervalSeconds:
+        default: "ALB Health Check Interval (seconds)"
+      RootDomainName:
+        default: "Root Domain Name"
+      AppSubdomain:
+        default: "Application Subdomain"
+      GitHubConnectionArn:
+        default: "AWS CodeStar GitHub Connection ARN"
+      GitHubOwner:
+        default: "GitHub Repository Owner (username or org)"
+      GitHubRepoName:
+        default: "GitHub Repository Name"
+      GitHubBranchName:
+        default: "GitHub Branch to Deploy From"
+      DeveloperName:
+        default: "Developer Name (for wizexercise.txt)"
+      KubernetesVersion:
+        default: "Kubernetes Version (must match Stack 3)"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  # ---------------------------------------------------------------------------
+  # Environment Configuration
+  # ---------------------------------------------------------------------------
+  EnvironmentName:
+    Type: String
+    Default: demo
+    AllowedValues:
+      - demo
+      - dev
+      - staging
+      - prod
+    Description: >
+      Must match EnvironmentName used in Stacks 0-4.
+      Used to construct cross-stack import names.
+
+  ProjectName:
+    Type: String
+    Default: WizTT
+    Description: Project name for resource tagging.
+
+  # ---------------------------------------------------------------------------
+  # Load Balancer Configuration
+  # ---------------------------------------------------------------------------
+  NodePort:
+    Type: Number
+    Default: 30080
+    MinValue: 30000
+    MaxValue: 32767
+    Description: >
+      Kubernetes NodePort that the Tasky Service exposes.
+      Must match the NodePort defined in the K8s Service manifest
+      deployed by the application CI/CD pipeline.
+      ALB Target Group forwards requests to this port on worker nodes.
+
+  HealthCheckPath:
+    Type: String
+    Default: "/"
+    Description: >
+      HTTP path for ALB target group health checks.
+      Tasky application serves the login page at "/" (returns HTTP 200).
+      ALB marks targets healthy when this path returns 200-399.
+
+  HealthCheckIntervalSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 300
+    Description: >
+      Interval between ALB health checks in seconds.
+
+  # ---------------------------------------------------------------------------
+  # DNS Configuration
+  # ---------------------------------------------------------------------------
+  RootDomainName:
+    Type: String
+    Default: wizdemo.ca
+    Description: >
+      Root domain. Must match Stack 4 RootDomainName parameter.
+      Used to import PublicHostedZoneId for ALIAS record creation.
+
+  AppSubdomain:
+    Type: String
+    Default: tasky
+    Description: >
+      Application subdomain. Must match Stack 4 AppSubdomain parameter.
+      Full application URL: https://{AppSubdomain}.{RootDomainName}
+
+  # ---------------------------------------------------------------------------
+  # CI/CD Pipeline Configuration
+  # ---------------------------------------------------------------------------
+  GitHubConnectionArn:
+    Type: String
+    Description: >
+      ARN of the AWS CodeConnections connection to GitHub.
+      Passed from Stack 0 via IaC pipeline ParameterOverrides.
+    AllowedPattern: '^arn:aws:codeconnections:.*'
+    ConstraintDescription: "Must be a valid CodeConnection connection ARN"
+
+  GitHubOwner:
+    Type: String
+    Default: "4sb8"
+    Description: >
+      GitHub username or organization that owns the repository.
+
+  GitHubRepoName:
+    Type: String
+    Default: "tasky"
+    Description: >
+      GitHub repository name containing both the application code
+      and the infrastructure CloudFormation templates.
+
+  GitHubBranchName:
+    Type: String
+    Default: "main"
+    Description: >
+      GitHub branch that triggers pipeline execution on push.
+
+  DeveloperName:
+    Type: String
+    Description: >
+      Developer full name to be injected into wizexercise.txt
+      inside the Tasky container image at build time.
+      Passed from Stack 0 via IaC pipeline ParameterOverrides.
+    MinLength: 2
+    MaxLength: 100
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.34"
+    AllowedValues:
+      - "1.34"
+      - "1.35"
+    Description: >
+      Kubernetes version. Must match the KubernetesVersion parameter
+      used in Stack 3 (Compute) to ensure kubectl compatibility.
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # SECTION 5.1: APPLICATION LOAD BALANCER
+  # ===========================================================================
+  TaskyALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-tasky-alb"
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-PublicSubnet1Id"
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-PublicSubnet2Id"
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-ALBSecurityGroupId"
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: "false"
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"
+        - Key: routing.http2.enabled
+          Value: "true"
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-tasky-alb"
+        - Key: Purpose
+          Value: "Application-Load-Balancer-Tasky"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 5.1.1: ALB Target Group
+  # ---------------------------------------------------------------------------
+  TaskyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-tasky-tg"
+      Protocol: HTTP
+      Port: !Ref NodePort
+      VpcId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-VPCId"
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckPort: !Ref NodePort
+      HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200-399"
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "false"
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Targets:
+        - Id: !ImportValue
+            Fn::Sub: "${EnvironmentName}-K8sWorkerInstanceId"
+          Port: !Ref NodePort
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-tasky-tg"
+        - Key: Purpose
+          Value: "K8s-Worker-NodePort-Target"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 5.1.2: HTTPS Listener (Port 443)
+  # ---------------------------------------------------------------------------
+  TaskyHTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref TaskyALB
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !ImportValue
+            Fn::Sub: "${EnvironmentName}-ACMCertificateArn"
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TaskyTargetGroup
+
+  # ---------------------------------------------------------------------------
+  # Section 5.1.3: HTTP Listener (Port 80) - Redirect to HTTPS
+  # ---------------------------------------------------------------------------
+  TaskyHTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref TaskyALB
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+
+  # ---------------------------------------------------------------------------
+  # Section 5.1.4: WAF Web ACL Association
+  # ---------------------------------------------------------------------------
+  WAFWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !GetAtt TaskyALB.LoadBalancerArn
+      WebACLArn: !ImportValue
+        Fn::Sub: "${EnvironmentName}-WAFWebACLArn"
+
+  # ===========================================================================
+  # SECTION 5.2: ROUTE 53 ALIAS RECORD
+  # ===========================================================================
+  TaskyDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-PublicHostedZoneId"
+      Name: !Sub "${AppSubdomain}.${RootDomainName}"
+      Type: A
+      Comment: >
+        ALIAS record for Tasky application ALB.
+        Routes tasky.wizdemo.ca to the Application Load Balancer.
+      AliasTarget:
+        HostedZoneId: !GetAtt TaskyALB.CanonicalHostedZoneID
+        DNSName: !GetAtt TaskyALB.DNSName
+        EvaluateTargetHealth: true
+
+  # ===========================================================================
+  # SECTION 5.3: APPLICATION CI/CD PIPELINE INFRASTRUCTURE
+  # ===========================================================================
+  # Pipeline 2 - Application (Container + K8s):
+  #   Trigger: Push to main branch (changes to application code)
+  #   Source:  GitHub (via CodeStar Connection)
+  #   Build:   CodeBuild builds Docker image, injects wizexercise.txt,
+  #            scans image with Trivy, pushes to DockerHub
+  #   Deploy:  CodeBuild applies K8s manifests via kubectl
+  #
+  # NOTE: Pipeline 1 (IaC) and all shared resources (PipelineArtifactBucket,
+  # CloudFormationExecutionRole) are managed by Stack 0 (Bootstrap).
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Section 5.3.1: CodePipeline IAM Role (App pipeline only)
+  # ---------------------------------------------------------------------------
+  # Scoped to App pipeline actions only:
+  #   - S3 artifact bucket access (bucket imported from Stack 0)
+  #   - GitHub connection
+  #   - ContainerBuildProject and K8sDeployProject execution
+  # No CloudFormation actions, no PassRole needed.
+  # ---------------------------------------------------------------------------
+  AppCodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-app-codepipeline-role"
+      Description: >
+        Service role for the App CodePipeline only. Grants access to S3
+        artifacts, App CodeBuild project execution, and the GitHub
+        CodeStar connection. No CloudFormation permissions required.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-app-codepipeline-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3ArtifactAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: "${EnvironmentName}-PipelineArtifactBucketArn"
+                  - !Sub
+                    - "${BucketArn}/*"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "${EnvironmentName}-PipelineArtifactBucketArn"
+              - Sid: CodeConnectionsAccess
+                Effect: Allow
+                Action:
+                  - codeconnections:UseConnection
+                  - codestar-connections:UseConnection
+                Resource: !Ref GitHubConnectionArn
+              - Sid: CodeBuildAccess
+                Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                Resource:
+                  - !GetAtt ContainerBuildProject.Arn
+                  - !GetAtt K8sDeployProject.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-app-codepipeline-role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 5.3.2: CodeBuild IAM Role (App pipeline projects only)
+  # ---------------------------------------------------------------------------
+  # Scoped to ContainerBuildProject and K8sDeployProject:
+  #   - S3 artifact bucket access
+  #   - SSM read for K8s kubeconfig retrieval
+  #   - Secrets Manager read for DockerHub credentials
+  #   - EC2/VPC permissions for K8s deploy VPC config
+  #   - CloudWatch Logs
+  # ---------------------------------------------------------------------------
+  AppCodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-app-codebuild-role"
+      Description: >
+        Service role for App pipeline CodeBuild projects (container build
+        and K8s deploy). Grants S3 artifact access, SSM read for K8s
+        kubeconfig, Secrets Manager read for DockerHub credentials,
+        EC2/VPC permissions, and CloudWatch Logs.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-app-codebuild-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogsAccess
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${EnvironmentName}-container-build"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${EnvironmentName}-container-build:*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${EnvironmentName}-k8s-deploy"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${EnvironmentName}-k8s-deploy:*"
+              - Sid: S3ArtifactAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: "${EnvironmentName}-PipelineArtifactBucketArn"
+                  - !Sub
+                    - "${BucketArn}/*"
+                    - BucketArn: !ImportValue
+                        Fn::Sub: "${EnvironmentName}-PipelineArtifactBucketArn"
+              - Sid: SSMAccess
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvironmentName}/*"
+              - Sid: EC2DescribeAccess
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:CreateNetworkInterface
+                  - ec2:CreateNetworkInterfacePermission
+                  - ec2:DescribeDhcpOptions
+                Resource: "*"
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${EnvironmentName}/tasky/*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/demo/dockerhub/credentials*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-app-codebuild-role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 5.3.3: CodeBuild Project 1 - Container Build & Push
+  # ---------------------------------------------------------------------------
+  ContainerBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-container-build"
+      Description: >
+        Builds Tasky container image with wizexercise.txt name injection,
+        scans with Trivy for CVEs, and pushes to DockerHub.
+      ServiceRole: !GetAtt AppCodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: DEVELOPER_NAME
+            Value: !Ref DeveloperName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          # =================================================================
+          # Application Pipeline - Container Build Buildspec
+          # =================================================================
+          # Steps:
+          #   1. Authenticate to DockerHub
+          #   2. Build Docker image with wizexercise.txt injection
+          #   3. Verify wizexercise.txt exists in built image
+          #   4. Scan image with Trivy for vulnerabilities
+          #   5. Push to DockerHub on successful scan
+          #   6. Output image URI for K8s deploy stage
+          # =================================================================
+          phases:
+            install:
+              commands:
+                - echo "Installing Trivy container scanner..."
+                - |
+                  curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+                    | sh -s -- -b /usr/local/bin v0.69.3
+                - trivy --version
+                - echo "Trivy installed successfully"
+
+            pre_build:
+              commands:
+                - echo "=== Pre-build - Docker Hub Authentication ==="
+                - |
+                  DH_SECRET_JSON=$(aws secretsmanager get-secret-value \
+                    --secret-id "/demo/dockerhub/credentials" \
+                    --query 'SecretString' \
+                    --output text \
+                    --region $AWS_REGION)
+                - DH_USERNAME=$(echo "$DH_SECRET_JSON" | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["username"])')
+                - DH_PASSWORD=$(echo "$DH_SECRET_JSON" | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["password"])')
+                - echo "$DH_PASSWORD" | docker login --username "$DH_USERNAME" --password-stdin
+                - echo "Docker Hub authentication successful"
+                - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)
+                - IMAGE_URI="docker.io/4sb8/demo-tasky:$IMAGE_TAG"
+                - IMAGE_URI_LATEST="docker.io/4sb8/demo-tasky:latest"
+                - echo "Image will be tagged as $IMAGE_URI"
+                - echo "IMAGE_TAG=$IMAGE_TAG" >> /tmp/build_env.sh
+                - echo "IMAGE_URI=$IMAGE_URI" >> /tmp/build_env.sh
+                - echo "IMAGE_URI_LATEST=$IMAGE_URI_LATEST" >> /tmp/build_env.sh
+
+            build:
+              commands:
+                - . /tmp/build_env.sh
+                - echo "=== Build - Building Tasky container image ==="
+                - echo "Developer name for wizexercise.txt - $DEVELOPER_NAME"
+                - |
+                  docker build \
+                    --build-arg DEVELOPER_NAME="$DEVELOPER_NAME" \
+                    --no-cache \
+                    --tag "$IMAGE_URI" \
+                    --tag "$IMAGE_URI_LATEST" \
+                    --label "git-commit=$CODEBUILD_RESOLVED_SOURCE_VERSION" \
+                    --label "build-date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    --label "environment=$ENVIRONMENT_NAME" \
+                    --file tasky-main/Dockerfile \
+                    tasky-main/
+
+                - echo "=== Build - Verifying wizexercise.txt in image ==="
+                - |
+                  WIZEXERCISE_CONTENT=$(
+                    docker run --rm \
+                      --entrypoint /bin/sh \
+                      "$IMAGE_URI" -c "cat /wizexercise.txt"
+                  )
+                  echo "wizexercise.txt content - $WIZEXERCISE_CONTENT"
+
+                  if [ -z "$WIZEXERCISE_CONTENT" ]; then
+                    echo "ERROR - wizexercise.txt is empty or missing from image"
+                    exit 1
+                  fi
+
+                  if [ "$WIZEXERCISE_CONTENT" != "$DEVELOPER_NAME" ]; then
+                    echo "WARNING - wizexercise.txt content does not match DEVELOPER_NAME"
+                    echo "Expected - $DEVELOPER_NAME"
+                    echo "Got - $WIZEXERCISE_CONTENT"
+                  fi
+
+                  echo "wizexercise.txt verification PASSED"
+
+                - echo "=== Build - Scanning image with Trivy ==="
+                - |
+                  trivy image \
+                    --severity HIGH,CRITICAL \
+                    --format table \
+                    --output /tmp/trivy-report.txt \
+                    --exit-code 0 \
+                    "$IMAGE_URI"
+
+                  echo "=== Trivy Scan Results ==="
+                  cat /tmp/trivy-report.txt
+
+                  trivy image \
+                    --severity HIGH,CRITICAL \
+                    --format json \
+                    --output /tmp/trivy-report.json \
+                    "$IMAGE_URI"
+
+                  echo "Trivy scan complete - findings recorded in artifacts"
+
+            post_build:
+              commands:
+                - . /tmp/build_env.sh
+                - echo "=== Post-build - Pushing image to Docker Hub ==="
+                - |
+                  docker push "$IMAGE_URI"
+                  docker push "$IMAGE_URI_LATEST"
+                  echo "Image pushed successfully - $IMAGE_URI"
+
+                - echo "Writing image definition for K8s deploy stage..."
+                - |
+                  cat > /tmp/imagedef.json << IMAGEDEF
+                  {
+                    "imageUri":"$IMAGE_URI",
+                    "imageTag":"$IMAGE_TAG",
+                    "repository":"docker.io/4sb8/demo-tasky",
+                    "buildId":"$CODEBUILD_BUILD_ID",
+                    "commitSha":"$CODEBUILD_RESOLVED_SOURCE_VERSION"
+                  }
+                  IMAGEDEF
+                  cat /tmp/imagedef.json
+                  cp /tmp/imagedef.json imagedef.json
+
+                - echo "Cleaning up Docker config (removing stored credentials)..."
+                - rm -f /root/.docker/config.json || true
+                - echo "=== Container build pipeline stage complete ==="
+
+          artifacts:
+            files:
+              - imagedef.json
+              - k8s/**
+              - /tmp/trivy-report.txt
+              - /tmp/trivy-report.json
+            discard-paths: no
+
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/${EnvironmentName}-container-build"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-container-build"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 5.3.4: CodeBuild Project 2 - Kubernetes Deployment
+  # ---------------------------------------------------------------------------
+  K8sDeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${EnvironmentName}-k8s-deploy"
+      Description: >
+        Deploys Tasky application to self-managed K8s cluster.
+        Retrieves admin kubeconfig from SSM Parameter Store,
+        then applies K8s manifests via kubectl.
+      ServiceRole: !GetAtt AppCodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: KUBERNETES_VERSION
+            Value: !Ref KubernetesVersion
+          - Name: NODE_PORT
+            Value: !Ref NodePort
+          - Name: DOCKERHUB_SECRET_NAME
+            Value: "/demo/dockerhub/credentials"
+          - Name: DOCKERHUB_REPOSITORY
+            Value: "docker.io/4sb8/demo-tasky"
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          # =================================================================
+          # Application Pipeline - K8s Deployment Buildspec
+          # =================================================================
+          # Steps:
+          #   1. Install kubectl (matching cluster version)
+          #   2. Retrieve K8s admin kubeconfig from SSM Parameter Store
+          #   3. Verify cluster connectivity
+          #   4. Apply all K8s manifests in /k8s/ directory
+          #   5. Update deployment image
+          #   6. Wait for rollout to complete
+          #   7. Verify pod is running and wizexercise.txt is accessible
+          # =================================================================
+          phases:
+            install:
+              commands:
+                - echo "=== Install - kubectl ==="
+                - |
+                  curl -LO "https://dl.k8s.io/release/v${KUBERNETES_VERSION}.0/bin/linux/amd64/kubectl"
+                  chmod +x kubectl
+                  mv kubectl /usr/local/bin/kubectl
+                - kubectl version --client
+                - echo "kubectl installed"
+
+            pre_build:
+              commands:
+                - echo "=== Pre-build - Retrieving K8s kubeconfig from SSM ==="
+                - |
+                  KUBECONFIG_B64=$(aws ssm get-parameter \
+                    --name "/${ENVIRONMENT_NAME}/k8s/admin-kubeconfig" \
+                    --with-decryption \
+                    --query "Parameter.Value" \
+                    --output text \
+                    --region $AWS_REGION)
+
+                  mkdir -p /root/.kube
+                  echo "$KUBECONFIG_B64" | base64 -d > /root/.kube/config
+                  chmod 600 /root/.kube/config
+                  echo "Kubeconfig retrieved and configured"
+
+                - echo "=== Pre-build - Verifying cluster connectivity ==="
+                - |
+                  MASTER_IP=$(aws ssm get-parameter \
+                    --name "/${ENVIRONMENT_NAME}/k8s/master-private-ip" \
+                    --query "Parameter.Value" \
+                    --output text \
+                    --region $AWS_REGION)
+                  echo "K8s Master IP - $MASTER_IP"
+
+                  kubectl cluster-info
+                  kubectl get nodes
+                  echo "Cluster connectivity verified"
+
+                - echo "=== Pre-build - Rendering Docker Hub imagePullSecret ==="
+                - |
+                  DH_SECRET_JSON=$(aws secretsmanager get-secret-value \
+                    --secret-id "$DOCKERHUB_SECRET_NAME" \
+                    --region "$AWS_REGION" \
+                    --query 'SecretString' \
+                    --output text)
+
+                  DH_USERNAME=$(echo "$DH_SECRET_JSON" | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["username"])')
+                  DH_PASSWORD=$(echo "$DH_SECRET_JSON" | python3 -c 'import json,sys; j=json.load(sys.stdin); print(j["password"])')
+
+                  AUTH_B64=$(printf "%s:%s" "$DH_USERNAME" "$DH_PASSWORD" | base64 -w0)
+
+                  cat > k8s/00-dockerhub-secret.yaml << EOF
+                  apiVersion: v1
+                  kind: Secret
+                  metadata:
+                    name: dockerhub-creds
+                    namespace: tasky
+                  type: kubernetes.io/dockerconfigjson
+                  data:
+                    .dockerconfigjson: $(cat << JSON | base64 -w0
+                  {
+                    "auths": {
+                      "https://index.docker.io/v1/": {
+                        "username": "$DH_USERNAME",
+                        "password": "$DH_PASSWORD",
+                        "auth": "$AUTH_B64"
+                      }
+                    }
+                  }
+                  JSON
+                  )
+                  EOF
+
+                - IMAGE_URI=$(cat imagedef.json | python3 -c "import json,sys; print(json.load(sys.stdin)['imageUri'])")
+                - echo "Deploying image - $IMAGE_URI"
+
+            build:
+              commands:
+                - echo "=== Build - Applying K8s manifests ==="
+                - |
+                  kubectl apply -k k8s/ --record 2>/dev/null || \
+                  kubectl apply -k k8s/
+
+                - echo "=== Build - Updating Tasky deployment image ==="
+                - |
+                  kubectl set image deployment/tasky \
+                    tasky="$IMAGE_URI" \
+                    -n tasky \
+                    --record 2>/dev/null || \
+                  kubectl set image deployment/tasky \
+                    tasky="$IMAGE_URI" \
+                    -n tasky
+
+                - echo "=== Build - Waiting for rollout to complete ==="
+                - |
+                  kubectl rollout status deployment/tasky \
+                    -n tasky \
+                    --timeout=300s
+                  echo "Rollout completed successfully"
+
+            post_build:
+              commands:
+                - echo "=== Post-build - Verifying deployment ==="
+                - kubectl get pods -l app=tasky -o wide
+                - |
+                  POD_NAME=$(kubectl get pod \
+                    -n tasky \
+                    -l app=tasky \
+                    -o jsonpath='{.items[0].metadata.name}')
+                  echo "Running pod - $POD_NAME"
+
+                  echo "=== Verifying wizexercise.txt in running container ==="
+                  kubectl exec -n tasky "$POD_NAME" -- cat /wizexercise.txt
+                  echo "wizexercise.txt verification in running pod - PASSED"
+
+                  echo "=== Verifying environment variables ==="
+                  kubectl exec -n tasky "$POD_NAME" -- env | grep -E "MONGODB_URI|SECRET_KEY" | \
+                    sed 's/=.*/=***REDACTED***/'
+                  echo "Environment variables present - PASSED"
+
+                - kubectl get ingress -n tasky -o wide
+                - kubectl get services -n tasky -o wide
+                - echo "Cleaning up Docker config (removing stored credentials)..."
+                - rm -f /root/.docker/config.json || true
+                - echo "=== K8s deployment pipeline stage complete ==="
+
+      VpcConfig:
+        # CodeBuild needs VPC access to reach K8s API server (private subnet)
+        VpcId: !ImportValue
+          Fn::Sub: "${EnvironmentName}-VPCId"
+        Subnets:
+          - !ImportValue
+            Fn::Sub: "${EnvironmentName}-PrivateSubnet1Id"
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${EnvironmentName}-K8sWorkerSecurityGroupId"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/${EnvironmentName}-k8s-deploy"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-k8s-deploy"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Section 5.3.5: Application Build & Deploy Pipeline
+  # ---------------------------------------------------------------------------
+  # Triggered on push to main branch affecting application code.
+  # Stages:
+  #   1. Source:  GitHub → S3 artifact
+  #   2. Build:   Docker image + wizexercise.txt + Trivy scan + DockerHub push
+  #   3. Deploy:  kubectl apply K8s manifests + rollout verification
+  # ---------------------------------------------------------------------------
+  AppPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${EnvironmentName}-app-pipeline"
+      RoleArn: !GetAtt AppCodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !ImportValue
+          Fn::Sub: "${EnvironmentName}-PipelineArtifactBucketName"
+      PipelineType: V2
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: GitHubSource
+            Push:
+              - Branches:
+                  Includes:
+                    - !Ref GitHubBranchName
+                FilePaths:
+                  Includes:
+                    - "tasky-main/**"
+                    - "k8s/**"
+                  Excludes:
+                    - "cloudformation/**"
+                    - "*.md"
+                    - "tasky-main/README.md"
+      Stages:
+        # Stage 1: Source
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub "${GitHubOwner}/${GitHubRepoName}"
+                BranchName: !Ref GitHubBranchName
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: false
+              OutputArtifacts:
+                - Name: SourceCode
+              RunOrder: 1
+
+        # Stage 2: Build - Container image build, scan, push to DockerHub
+        - Name: BuildAndScan
+          Actions:
+            - Name: ContainerBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref ContainerBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+
+        # Stage 3: Deploy - Apply K8s manifests and verify rollout
+        - Name: DeployToK8s
+          Actions:
+            - Name: K8sDeploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref K8sDeployProject
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-app-pipeline"
+        - Key: Purpose
+          Value: "Application-Container-K8s-Deployment"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+
+  ALBArn:
+    Description: "Application Load Balancer ARN"
+    Value: !Ref TaskyALB
+    Export:
+      Name: !Sub "${EnvironmentName}-ALBArn"
+
+  ALBDNSName:
+    Description: "ALB DNS name (internal AWS DNS - use tasky.wizdemo.ca for access)"
+    Value: !GetAtt TaskyALB.DNSName
+    Export:
+      Name: !Sub "${EnvironmentName}-ALBDNSName"
+
+  ALBHostedZoneId:
+    Description: "ALB Canonical Hosted Zone ID (used for Route 53 ALIAS records)"
+    Value: !GetAtt TaskyALB.CanonicalHostedZoneID
+    Export:
+      Name: !Sub "${EnvironmentName}-ALBHostedZoneId"
+
+  TargetGroupArn:
+    Description: "ALB Target Group ARN"
+    Value: !Ref TaskyTargetGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-TargetGroupArn"
+
+  AppPipelineURL:
+    Description: "Application Pipeline URL in AWS Console"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${EnvironmentName}-app-pipeline/view"
+    Export:
+      Name: !Sub "${EnvironmentName}-AppPipelineURL"

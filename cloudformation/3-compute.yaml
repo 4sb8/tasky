@@ -1,0 +1,2043 @@
+# =============================================================================
+# WizTT - Stack 3: Compute
+# =============================================================================
+# Description:
+#   Deploys all EC2 instances for the demo environment:
+#     - MongoDB EC2 (intentionally outdated OS + MongoDB version)
+#     - Kubernetes Master Node (self-managed kubeadm)
+#     - Kubernetes Worker Node (self-managed kubeadm)
+#
+# Deployment Order: 3 of 5
+# Depends On:      Stack 1 (VPC & Networking), Stack 2 (Security & IAM)
+# Exports To:      Stack 4 (Observability), Stack 5 (Application)
+#
+# Resources Created:
+#   - MongoDB EC2 instance (public subnet, outdated OS, outdated MongoDB)
+#   - MongoDB backup S3 bucket (public read + listing - intentional weakness)
+#   - AWS Secrets Manager secrets (MongoDB URI components, JWT secret key)
+#   - K8s Master EC2 instance (private subnet, kubeadm bootstrapped)
+#   - K8s Worker EC2 instance (private subnet, kubeadm bootstrapped)
+#   - SSM Parameters for K8s join token exchange between master and worker
+#   - CloudWatch Log Groups for K8s Master and Worker (created here to avoid
+#     race condition with Stack 4 - instances create log groups on boot
+#     before Stack 4 can create them)
+#
+# Intentional Security Weaknesses (required by Wiz exercise):
+#   - MongoDB EC2: Amazon Linux 2 with updates DISABLED (1+ year old OS)
+#   - MongoDB: Version 4.4 installed
+#   - MongoDB EC2: SSH exposed to 0.0.0.0/0 (via SG in Stack 2)
+#   - MongoDB EC2: ec2:* IAM permissions (via role in Stack 2)
+#   - S3 backup bucket: Public read + public listing enabled
+#   - K8s: cluster-admin ClusterRoleBinding (applied via app CI/CD pipeline)
+#
+# Bootstrap Architecture:
+#   The K8s cluster bootstrap uses a coordinated sequence:
+#   1. Master node initializes with kubeadm, stores join command in SSM
+#   2. Worker node polls SSM Parameter Store until join command is available
+#   3. Worker executes join command to register with master
+#   This avoids hardcoding IPs or requiring manual intervention.
+#
+# CI/CD Notes:
+#   - K8s version pinned via parameter for reproducible deployments
+#   - UserData scripts log to /var/log/ for post-deployment debugging
+#
+# Last Updated:    2026-03-13
+# Version:         2.0.0
+# =============================================================================
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  WizTT Stack 3/5 - Compute.
+  Deploys MongoDB EC2 instance (intentionally outdated), Kubernetes Master
+  and Worker nodes (self-managed kubeadm with Calico CNI), S3 backup bucket,
+  AWS Secrets Manager secrets, and K8s CloudWatch log groups for the WizTT
+  environment.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - EnvironmentName
+          - ProjectName
+      - Label:
+          default: "MongoDB Configuration"
+        Parameters:
+          - MongoDBInstanceType
+          - MongoDBAMI
+          - MongoDBVersion
+          - MongoDBDatabaseName
+      - Label:
+          default: "Kubernetes Configuration"
+        Parameters:
+          - K8sMasterInstanceType
+          - K8sWorkerInstanceType
+          - K8sAMI
+          - KubernetesVersion
+          - CalicoVersion
+          - PodNetworkCidr
+      - Label:
+          default: "CloudWatch Configuration"
+        Parameters:
+          - LogRetentionDays
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - DomainName
+      - Label:
+          default: "S3 Backup Configuration"
+        Parameters:
+          - BackupBucketName
+
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      MongoDBInstanceType:
+        default: "MongoDB Instance Type"
+      MongoDBAMI:
+        default: "MongoDB Instance AMI (must be 1+ year old)"
+      MongoDBVersion:
+        default: "MongoDB Version (must be 1+ year old)"
+      MongoDBDatabaseName:
+        default: "MongoDB Database Name"
+      K8sMasterInstanceType:
+        default: "K8s Master Instance Type"
+      K8sWorkerInstanceType:
+        default: "K8s Worker Instance Type"
+      K8sAMI:
+        default: "K8s Nodes AMI (latest Amazon Linux 2023)"
+      KubernetesVersion:
+        default: "Kubernetes Version"
+      PodNetworkCidr:
+        default: "Kubernetes Pod Network CIDR (Calico)"
+      LogRetentionDays:
+        default: "CloudWatch Log Retention (Days)"
+      DomainName:
+        default: "Application Domain Name"
+      BackupBucketName:
+        default: "S3 Backup Bucket Name"
+      CalicoVersion:
+        default: "Calico CNI Version"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  # ---------------------------------------------------------------------------
+  # Environment Configuration
+  # ---------------------------------------------------------------------------
+  EnvironmentName:
+    Type: String
+    Default: demo
+    AllowedValues:
+      - demo
+      - dev
+      - staging
+      - prod
+    Description: >
+      Must match the EnvironmentName used in Stack 1 and Stack 2.
+      Used to import cross-stack references and name resources consistently.
+
+  ProjectName:
+    Type: String
+    Default: WizTT
+    Description: Project name for resource tagging.
+
+  # ---------------------------------------------------------------------------
+  # MongoDB Configuration
+  # ---------------------------------------------------------------------------
+  MongoDBInstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: >
+      EC2 instance type for MongoDB server.
+
+  MongoDBAMI:
+    Type: AWS::EC2::Image::Id
+    Default: ami-0c2ab3b8efb09f272
+    Description: >
+      INTENTIONAL WEAKNESS: AMI ID for MongoDB EC2 instance.
+      Must be an Amazon Linux 2 AMI that is 1+ year old.
+      Default: Amazon Linux 2 ami-0c2ab3b8efb09f272 (us-west-2, 2022 vintage).
+      OS updates are DISABLED in UserData to preserve the outdated state.
+
+  MongoDBVersion:
+    Type: String
+    Default: "4.4"
+    AllowedValues:
+      - "4.4"
+      - "5.0"
+    Description: >
+      INTENTIONAL WEAKNESS: MongoDB version to install.
+      MongoDB 4.4 was released July 2020.
+
+  MongoDBDatabaseName:
+    Type: String
+    Default: go-mongodb
+    Description: >
+      MongoDB database name. MUST be "go-mongodb" to match the hardcoded
+      database name in the Tasky application (database.go:
+      client.Database("go-mongodb")). Do not change this value.
+
+  # ---------------------------------------------------------------------------
+  # Kubernetes Configuration
+  # ---------------------------------------------------------------------------
+  K8sMasterInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.medium
+      - t3.large
+    Description: >
+      EC2 instance type for K8s Master node.
+      t3.medium is the minimum recommended for kubeadm as
+      control plane components (API server, etcd, scheduler,
+      controller-manager) require at least 2 vCPU and 2GB RAM.
+
+  K8sWorkerInstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.small
+      - t3.medium
+    Description: >
+      EC2 instance type for K8s Worker node.
+
+  K8sAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      AMI ID for K8s Master and Worker nodes.
+      Uses SSM Parameter Store to resolve to the latest Amazon Linux 2023 AMI.
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.34"
+    AllowedValues:
+      - "1.34"
+      - "1.35"
+    Description: >
+      Kubernetes version to install via kubeadm.
+
+  PodNetworkCidr:
+    Type: String
+    Default: "192.168.0.0/16"
+    Description: >
+      CIDR for the Kubernetes pod network managed by Calico CNI.
+      This value is passed to kubeadm init --pod-network-cidr and must
+      match the Calico ConfigMap configuration applied post-init.
+
+  CalicoVersion:
+    Type: String
+    Default: "v3.31.4"
+    Description: >
+      Calico CNI version to install on K8s nodes.
+      Latest stable v3.31.4 as of March 2026.
+      Compatible with Kubernetes 1.34 and 1.35.
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Configuration
+  # ---------------------------------------------------------------------------
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues:
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+    Description: >
+      Retention period for K8s CloudWatch Log Groups.
+      Must match LogRetentionDays in Stack 4 for consistency.
+
+  # ---------------------------------------------------------------------------
+  # Application Configuration
+  # ---------------------------------------------------------------------------
+  DomainName:
+    Type: String
+    Default: wizdemo.ca
+    Description: >
+      Root domain name. Used to construct the full MongoDB internal DNS name
+      stored in Secrets Manager: mongodb.internal.{DomainName}
+      Must match the Route 53 hosted zone created in Stack 4.
+
+  # ---------------------------------------------------------------------------
+  # S3 Backup Configuration
+  # ---------------------------------------------------------------------------
+  BackupBucketName:
+    Type: String
+    Default: demo-mongodb-backups-390403859369
+    Description: >
+      S3 bucket name for MongoDB backups.
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # SECTION 3.0: CLOUDWATCH LOG GROUPS
+  # ===========================================================================
+  # K8s Master and Worker log groups are created here rather than in Stack 4
+  # to avoid a race condition: the K8s instances (launched in this stack)
+  # create these log groups automatically on boot via the CloudWatch agent.
+  # If Stack 4 tried to create them, it would fail with AlreadyExistsException.
+  # This follows the same pattern as VPC Flow Logs in Stack 1.
+  # MongoDB log group remains in Stack 4 as MongoDB does not auto-create it.
+  # ===========================================================================
+
+  # K8s Master Node logs
+  # Receives: bootstrap logs, kubeadm-init logs, system messages
+  K8sMasterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: "/aws/ec2/k8s-master"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-k8s-master-logs"
+        - Key: Purpose
+          Value: "K8s-Control-Plane-Logs"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # K8s Worker Node logs
+  # Receives: bootstrap logs, kubeadm-join logs, system messages
+  K8sWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: "/aws/ec2/k8s-worker"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-k8s-worker-logs"
+        - Key: Purpose
+          Value: "K8s-Worker-Node-Logs"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # SECTION 3.1: S3 BACKUP BUCKET
+  # ===========================================================================
+  # INTENTIONAL SECURITY WEAKNESSES:
+  #   1. Public read access - anyone can read MongoDB backup files
+  #   2. Public listing - anyone can enumerate all backup files
+  #   3. No encryption at rest - backup files stored in plaintext
+  #   4. No versioning - overwritten backups cannot be recovered
+  # ===========================================================================
+  MongoDBBackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Ref BackupBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      VersioningConfiguration:
+        Status: Suspended
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldBackups
+            Status: Enabled
+            ExpirationInDays: 30
+            Prefix: "backups/"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mongodb-backups"
+        - Key: Purpose
+          Value: "MongoDB-Backup-Storage"
+        - Key: SecurityWeakness
+          Value: "Public-Read-List-No-Encryption"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  MongoDBBackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MongoDBBackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadBackups
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+            Resource: !Sub "${MongoDBBackupBucket.Arn}/backups/*"
+          - Sid: PublicListBucket
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:ListBucket
+            Resource: !GetAtt MongoDBBackupBucket.Arn
+          - Sid: MongoDBBackupWrite
+            Effect: Allow
+            Principal:
+              AWS: !ImportValue
+                Fn::Sub: "${EnvironmentName}-MongoDBInstanceRoleArn"
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt MongoDBBackupBucket.Arn
+              - !Sub "${MongoDBBackupBucket.Arn}/*"
+
+  # CloudTrail logs bucket - private, encrypted
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-cloudtrail-logs-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+            ExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-cloudtrail-logs"
+        - Key: Purpose
+          Value: "CloudTrail-Audit-Logs"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CloudTrailLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  # ===========================================================================
+  # SECTION 3.2: AWS SECRETS MANAGER
+  # ===========================================================================
+  # Stores sensitive configuration values for the Tasky application.
+  # These secrets are synced into K8s via External Secrets Operator (ESO)
+  # and injected into the Tasky pod as environment variables.
+  #
+  # MongoDBURISecret stores URI components as flat key-value pairs.
+  # ESO assembles the full URI string at runtime using its template feature.
+  # This avoids the CloudFormation limitation of not being able to reference
+  # another secret's generated value within the same stack.
+  # ===========================================================================
+
+  MongoAdminCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "/${EnvironmentName}/mongodb/admin-credentials"
+      Description: "Credentials for MongoDB admin user mongoadmin - WizTT exercise"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"mongoadmin"}'
+        GenerateStringKey: "password"
+        ExcludePunctuation: true
+
+  TaskyMongoCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "/${EnvironmentName}/tasky/mongodb-credentials"
+      Description: "Tasky MongoDB app user credentials"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"taskyadmin"}'
+        GenerateStringKey: "password"
+        ExcludePunctuation: true
+
+  # ---------------------------------------------------------------------------
+  # MongoDB URI components secret
+  # ---------------------------------------------------------------------------
+  # Stores the static components of the MongoDB connection URI as flat
+  # key-value pairs. The password is intentionally excluded here — it is
+  # generated separately in TaskyMongoCredentialsSecret.
+  #
+  # ESO assembles the full URI in the ExternalSecret template:
+  #   mongodb://{{ .username }}:{{ .password }}@{{ .host }}:{{ .port }}/{{ .database }}?authSource=admin
+  #
+  # ESO pulls:
+  #   - username, host, port, database from this secret (dataFrom extract)
+  #   - password from /${EnvironmentName}/tasky/mongodb-credentials (dataFrom extract)
+  # ---------------------------------------------------------------------------
+  MongoDBURISecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "/${EnvironmentName}/tasky/mongodb-uri"
+      Description: >
+        MongoDB URI components for Tasky. ESO assembles these into the
+        full MONGODB_URI connection string at runtime via template interpolation.
+      SecretString: !Sub |
+        {
+          "username": "taskyadmin",
+          "host": "mongodb.internal.${DomainName}",
+          "port": "27017",
+          "database": "${MongoDBDatabaseName}"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mongodb-uri"
+        - Key: Purpose
+          Value: "Tasky-MongoDB-Connection"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  JWTSecretKeySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "/${EnvironmentName}/tasky/secret-key"
+      Description: "JWT secret key for Tasky token signing. Injected as SECRET_KEY env var into the Tasky K8s pod via ESO."
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-jwt-secret-key"
+        - Key: Purpose
+          Value: "Tasky-JWT-Authentication"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # SECTION 3.2b: SSM PARAMETER STORE - MONGODB CONFIG FILES
+  # ===========================================================================
+  MongoDBRepoFileParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/mongodb/config/repo-file"
+      Type: String
+      Value: |
+        [mongodb-org-4.4]
+        name=MongoDB Repository
+        baseurl=https://repo.mongodb.org/yum/amazon/2/mongodb-org/4.4/x86_64/
+        gpgcheck=1
+        enabled=1
+        gpgkey=https://www.mongodb.org/static/pgp/server-4.4.asc
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  MongoDBConfParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/mongodb/config/mongod-conf"
+      Type: String
+      Value: |
+        # mongod.conf - WizTT MongoDB Configuration
+        storage:
+          dbPath: /var/lib/mongo
+          journal:
+            enabled: true
+          engine: wiredTiger
+
+        systemLog:
+          destination: file
+          logAppend: true
+          path: /var/log/mongodb/mongod.log
+
+        net:
+          bindIp: 0.0.0.0
+          port: 27017
+
+        processManagement:
+          fork: false
+          pidFilePath: /var/run/mongodb/mongod.pid
+          timeZoneInfo: /usr/share/zoneinfo
+
+        security:
+          authorization: enabled
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  MongoDBYumExcludeParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/mongodb/config/yum-exclude"
+      Type: String
+      Value: "exclude=mongodb-org,mongodb-org-server,mongodb-org-shell,mongodb-org-mongos,mongodb-org-tools"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  K8sRepoFileParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/k8s/config/kubernetes-repo"
+      Type: String
+      Description: "Kubernetes yum repository configuration file"
+      Value: !Sub |
+        [kubernetes]
+        name=Kubernetes
+        baseurl=https://pkgs.k8s.io/core:/stable:/v${KubernetesVersion}/rpm/
+        enabled=1
+        gpgcheck=1
+        gpgkey=https://pkgs.k8s.io/core:/stable:/v${KubernetesVersion}/rpm/repodata/repomd.xml.key
+        exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  MongoDBPrivateIPParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/mongodb/private-ip"
+      Type: String
+      Value: !GetAtt MongoDBInstance.PrivateIp
+      Description: "MongoDB EC2 private IP for Route 53 DNS record in Stack 4"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  CalicoInstallationParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/k8s/config/calico-installation"
+      Type: String
+      Description: "Calico CNI Installation manifest for K8s cluster"
+      Value: |
+        apiVersion: operator.tigera.io/v1
+        kind: Installation
+        metadata:
+          name: default
+        spec:
+          calicoNetwork:
+            bgp: Disabled
+            ipPools:
+            - name: default-ipv4-ippool
+              blockSize: 26
+              cidr: POD_CIDR_PLACEHOLDER
+              encapsulation: VXLANCrossSubnet
+              natOutgoing: Enabled
+              nodeSelector: all()
+        ---
+        apiVersion: operator.tigera.io/v1
+        kind: APIServer
+        metadata:
+          name: default
+        spec: {}
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  K8sMasterPrivateIPParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/k8s/master-private-ip"
+      Type: String
+      Value: !GetAtt K8sMasterInstance.PrivateIp
+      Description: "K8s Master private IP for worker node join and admin kubectl access"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  K8sWorkerPrivateIPParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/k8s/worker-private-ip"
+      Type: String
+      Value: !GetAtt K8sWorkerInstance.PrivateIp
+      Description: "K8s Worker private IP for ALB target registration reference"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  # ===========================================================================
+  # SECTION 3.2c: CLOUDWATCH AGENT CONFIGURATIONS VIA SSM
+  # ===========================================================================
+
+  K8sMasterCWAgentConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/k8s-master/config/cloudwatch-agent"
+      Type: String
+      Description: "CloudWatch agent config for K8s Master node"
+      Value: |
+        {
+          "agent": {
+            "metrics_collection_interval": 60,
+            "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log"
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/k8s-master-bootstrap.log",
+                    "log_group_name": "/aws/ec2/k8s-master",
+                    "log_stream_name": "{instance_id}/bootstrap",
+                    "timezone": "UTC"
+                  },
+                  {
+                    "file_path": "/var/log/kubeadm-init.log",
+                    "log_group_name": "/aws/ec2/k8s-master",
+                    "log_stream_name": "{instance_id}/kubeadm-init",
+                    "timezone": "UTC"
+                  },
+                  {
+                    "file_path": "/var/log/messages",
+                    "log_group_name": "/aws/ec2/k8s-master",
+                    "log_stream_name": "{instance_id}/messages",
+                    "timezone": "UTC"
+                  }
+                ]
+              }
+            }
+          },
+          "metrics": {
+            "namespace": "WizTT/K8sMaster",
+            "metrics_collected": {
+              "cpu": {
+                "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
+                "metrics_collection_interval": 60
+              },
+              "mem": {
+                "measurement": ["mem_used_percent"],
+                "metrics_collection_interval": 60
+              },
+              "disk": {
+                "measurement": ["disk_used_percent"],
+                "resources": ["/"],
+                "metrics_collection_interval": 60
+              }
+            }
+          }
+        }
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  K8sWorkerCWAgentConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/k8s-worker/config/cloudwatch-agent"
+      Type: String
+      Description: "CloudWatch agent config for K8s Worker node"
+      Value: |
+        {
+          "agent": {
+            "metrics_collection_interval": 60,
+            "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log"
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/k8s-worker-bootstrap.log",
+                    "log_group_name": "/aws/ec2/k8s-worker",
+                    "log_stream_name": "{instance_id}/bootstrap",
+                    "timezone": "UTC"
+                  },
+                  {
+                    "file_path": "/var/log/kubeadm-join.log",
+                    "log_group_name": "/aws/ec2/k8s-worker",
+                    "log_stream_name": "{instance_id}/kubeadm-join",
+                    "timezone": "UTC"
+                  },
+                  {
+                    "file_path": "/var/log/messages",
+                    "log_group_name": "/aws/ec2/k8s-worker",
+                    "log_stream_name": "{instance_id}/messages",
+                    "timezone": "UTC"
+                  }
+                ]
+              }
+            }
+          },
+          "metrics": {
+            "namespace": "WizTT/K8sWorker",
+            "metrics_collected": {
+              "cpu": {
+                "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
+                "metrics_collection_interval": 60
+              },
+              "mem": {
+                "measurement": ["mem_used_percent"],
+                "metrics_collection_interval": 60
+              },
+              "disk": {
+                "measurement": ["disk_used_percent"],
+                "resources": ["/"],
+                "metrics_collection_interval": 60
+              }
+            }
+          }
+        }
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  MongoDBCWAgentConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/mongodb/config/cloudwatch-agent"
+      Type: String
+      Description: "CloudWatch agent config for MongoDB EC2 instance"
+      Value: |
+        {
+          "agent": {
+            "metrics_collection_interval": 60,
+            "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log"
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/mongodb/mongod.log",
+                    "log_group_name": "/aws/ec2/mongodb",
+                    "log_stream_name": "{instance_id}/mongod",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%S",
+                    "timezone": "UTC"
+                  },
+                  {
+                    "file_path": "/var/log/mongodb-bootstrap.log",
+                    "log_group_name": "/aws/ec2/mongodb",
+                    "log_stream_name": "{instance_id}/bootstrap",
+                    "timezone": "UTC"
+                  },
+                  {
+                    "file_path": "/var/log/secure",
+                    "log_group_name": "/aws/ec2/mongodb",
+                    "log_stream_name": "{instance_id}/secure",
+                    "timezone": "UTC"
+                  },
+                  {
+                    "file_path": "/var/log/messages",
+                    "log_group_name": "/aws/ec2/mongodb",
+                    "log_stream_name": "{instance_id}/messages",
+                    "timezone": "UTC"
+                  }
+                ]
+              }
+            }
+          },
+          "metrics": {
+            "namespace": "WizTT/MongoDB",
+            "metrics_collected": {
+              "cpu": {
+                "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
+                "metrics_collection_interval": 60
+              },
+              "mem": {
+                "measurement": ["mem_used_percent", "mem_available"],
+                "metrics_collection_interval": 60
+              },
+              "disk": {
+                "measurement": ["disk_used_percent"],
+                "resources": ["/"],
+                "metrics_collection_interval": 60
+              }
+            }
+          }
+        }
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        ManagedBy: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # SSM Associations - deliver CW agent config and start agent on each instance
+  # ---------------------------------------------------------------------------
+  MongoDBCWAgentAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AmazonCloudWatch-ManageAgent
+      AssociationName: !Sub "${EnvironmentName}-mongodb-cw-agent"
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref MongoDBInstance
+      Parameters:
+        action:
+          - configure
+        mode:
+          - ec2
+        optionalConfigurationSource:
+          - ssm
+        optionalConfigurationLocation:
+          - !Ref MongoDBCWAgentConfigParameter
+        optionalRestart:
+          - 'yes'
+
+  K8sMasterCWAgentAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AmazonCloudWatch-ManageAgent
+      AssociationName: !Sub "${EnvironmentName}-k8s-master-cw-agent"
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref K8sMasterInstance
+      Parameters:
+        action:
+          - configure
+        mode:
+          - ec2
+        optionalConfigurationSource:
+          - ssm
+        optionalConfigurationLocation:
+          - !Ref K8sMasterCWAgentConfigParameter
+        optionalRestart:
+          - 'yes'
+
+  K8sWorkerCWAgentAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AmazonCloudWatch-ManageAgent
+      AssociationName: !Sub "${EnvironmentName}-k8s-worker-cw-agent"
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref K8sWorkerInstance
+      Parameters:
+        action:
+          - configure
+        mode:
+          - ec2
+        optionalConfigurationSource:
+          - ssm
+        optionalConfigurationLocation:
+          - !Ref K8sWorkerCWAgentConfigParameter
+        optionalRestart:
+          - 'yes'
+
+  # ===========================================================================
+  # SECTION 3.3: MONGODB EC2 INSTANCE
+  # ===========================================================================
+  # INTENTIONAL SECURITY WEAKNESSES:
+  #   1. Outdated Amazon Linux 2 AMI (1+ year old, fixed AMI ID parameter)
+  #   2. OS updates DISABLED in UserData (preserves outdated state)
+  #   3. MongoDB 4.4 installed (released 2020, multiple known CVEs)
+  #   4. SSH exposed to internet (via Stack 2 Security Group)
+  #   5. ec2:* IAM permissions (via Stack 2 IAM Role)
+  # ===========================================================================
+  MongoDBInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - MongoDBBackupBucket
+      - MongoDBURISecret
+      - MongoDBRepoFileParameter
+      - MongoDBConfParameter
+      - MongoDBYumExcludeParameter
+    Properties:
+      ImageId: !Ref MongoDBAMI
+      InstanceType: !Ref MongoDBInstanceType
+      SubnetId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-PublicSubnet2Id"
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: "${EnvironmentName}-MongoDBInstanceProfileName"
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-MongoDBSecurityGroupId"
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            Encrypted: false
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # =================================================================
+          # MongoDB EC2 Bootstrap Script
+          # =================================================================
+          set -e
+          exec > >(tee /var/log/mongodb-bootstrap.log | logger -t mongodb-bootstrap -s 2>/dev/console) 2>&1
+
+          echo "=== WizTT MongoDB Bootstrap Started ==="
+          echo "Timestamp: $(date)"
+          echo "Region: ${AWS::Region}"
+
+          # -----------------------------------------------------------------
+          # Step 1: Install minimum required tools
+          # INTENTIONALLY SKIP OS UPDATES (outdated OS required)
+          # -----------------------------------------------------------------
+          echo "=== Step 1: Installing required tools (skipping OS updates) ==="
+          echo "OS updates intentionally skipped - outdated OS required for Wiz exercise"
+
+          yum install -y \
+            aws-cli \
+            jq \
+            cronie \
+            curl \
+            ntp \
+            amazon-cloudwatch-agent \
+            aws-cfn-bootstrap
+
+          if [ ! -f /opt/aws/bin/cfn-signal ]; then
+            echo "ERROR: cfn-signal not found after aws-cfn-bootstrap install"
+            echo "Trying alternative installation path..."
+            yum install -y python3-pip || true
+            pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz || true
+          fi
+
+          ls -la /opt/aws/bin/cfn-signal || echo "WARNING: cfn-signal still not found"
+
+          systemctl enable ntpd
+          systemctl start ntpd
+
+          # -----------------------------------------------------------------
+          # Fetch MongoDB credentials from AWS Secrets Manager
+          # -----------------------------------------------------------------
+          echo "=== Fetching MongoDB credentials from Secrets Manager ==="
+
+          ADMIN_SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "/${EnvironmentName}/mongodb/admin-credentials" \
+            --query SecretString --output text \
+            --region ${AWS::Region})
+
+          TASKY_SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "/${EnvironmentName}/tasky/mongodb-credentials" \
+            --query SecretString --output text \
+            --region ${AWS::Region})
+
+          MONGO_ADMIN_USER=$(echo "$ADMIN_SECRET_JSON" | jq -r '.username')
+          MONGO_ADMIN_PASS=$(echo "$ADMIN_SECRET_JSON" | jq -r '.password')
+
+          TASKY_USER=$(echo "$TASKY_SECRET_JSON" | jq -r '.username')
+          TASKY_PASS=$(echo "$TASKY_SECRET_JSON" | jq -r '.password')
+
+          echo "Will create MongoDB users: $MONGO_ADMIN_USER (admin), $TASKY_USER (app)"
+
+          # -----------------------------------------------------------------
+          # Step 2: Install MongoDB 4.4 (intentionally outdated)
+          # -----------------------------------------------------------------
+          echo "=== Step 2: Installing MongoDB ${MongoDBVersion} ==="
+
+          aws ssm get-parameter \
+            --name "/${EnvironmentName}/mongodb/config/repo-file" \
+            --query "Parameter.Value" \
+            --output text \
+            --region ${AWS::Region} \
+            > /etc/yum.repos.d/mongodb-org-4.4.repo
+
+          echo "MongoDB repo file written:"
+          cat /etc/yum.repos.d/mongodb-org-4.4.repo
+
+          yum install -y \
+            mongodb-org-4.4.* \
+            mongodb-org-server-4.4.* \
+            mongodb-org-shell-4.4.* \
+            mongodb-org-mongos-4.4.* \
+            mongodb-org-tools-4.4.*
+
+          aws ssm get-parameter \
+            --name "/${EnvironmentName}/mongodb/config/yum-exclude" \
+            --query "Parameter.Value" \
+            --output text \
+            --region ${AWS::Region} \
+            >> /etc/yum.conf
+
+          echo "MongoDB version installed: $(mongod --version)"
+
+          # -----------------------------------------------------------------
+          # Step 3: Configure MongoDB
+          # -----------------------------------------------------------------
+          echo "=== Step 3: Configuring MongoDB ==="
+
+          mkdir -p /var/lib/mongo
+          mkdir -p /var/log/mongodb
+          chown -R mongod:mongod /var/lib/mongo
+          chown -R mongod:mongod /var/log/mongodb
+
+          aws ssm get-parameter \
+            --name "/${EnvironmentName}/mongodb/config/mongod-conf" \
+            --query "Parameter.Value" \
+            --output text \
+            --region ${AWS::Region} \
+            > /etc/mongod.conf
+
+          echo "mongod.conf written:"
+          cat /etc/mongod.conf
+
+          echo "Starting MongoDB without auth for initial user creation..."
+          mongod --config /etc/mongod.conf \
+            --noauth \
+            --fork \
+            --logpath /var/log/mongodb/mongod-init.log
+
+          echo "Waiting for MongoDB to start..."
+          MONGO_READY=false
+          for i in $(seq 1 60); do
+            if mongo --quiet --eval "db.adminCommand('ping').ok" 2>/dev/null | grep -q "1"; then
+              echo "MongoDB ready after ${!i} seconds"
+              MONGO_READY=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$MONGO_READY" = "false" ]; then
+            echo "ERROR: MongoDB did not start within 60 seconds"
+            cat /var/log/mongodb/mongod-init.log
+            exit 1
+          fi
+
+          # -----------------------------------------------------------------
+          # Step 4: Create MongoDB users
+          # -----------------------------------------------------------------
+          echo "=== Step 4: Creating MongoDB users ==="
+
+          cat > /tmp/create-users.js << 'MONGOJS'
+          db.createUser({
+            user: "MONGO_ADMIN_USER_PLACEHOLDER",
+            pwd: "MONGO_ADMIN_PASS_PLACEHOLDER",
+            roles: [
+              { role: "userAdminAnyDatabase", db: "admin" }
+            ]
+          });
+          print("mongoadmin user created");
+          MONGOJS
+
+          cat > /tmp/create-app-user.js << 'APPUSERJS'
+          db.createUser({
+            user: "TASKY_USER_PLACEHOLDER",
+            pwd: "TASKY_PASS_PLACEHOLDER",
+            roles: [
+              { role: "readWrite", db: "MONGO_DBNAME_PLACEHOLDER" }
+            ]
+          });
+          db.createCollection("todos");
+          db.createCollection("user");
+          print("Tasky app user and collections created");
+          APPUSERJS
+
+          sed -i "s|MONGO_ADMIN_USER_PLACEHOLDER|${!MONGO_ADMIN_USER}|g" /tmp/create-users.js
+          sed -i "s|MONGO_ADMIN_PASS_PLACEHOLDER|${!MONGO_ADMIN_PASS}|g" /tmp/create-users.js
+
+          sed -i "s|TASKY_USER_PLACEHOLDER|${!TASKY_USER}|g" /tmp/create-app-user.js
+          sed -i "s|TASKY_PASS_PLACEHOLDER|${!TASKY_PASS}|g" /tmp/create-app-user.js
+          sed -i "s|MONGO_DBNAME_PLACEHOLDER|${MongoDBDatabaseName}|g" /tmp/create-app-user.js
+
+          mongo admin /tmp/create-users.js
+          echo "Admin user created successfully"
+
+          mongo "${MongoDBDatabaseName}" /tmp/create-app-user.js
+          echo "App user and collections created successfully"
+
+          rm -f /tmp/create-users.js /tmp/create-app-user.js
+
+          # -----------------------------------------------------------------
+          # Step 5: Stop no-auth instance and start with authentication
+          # -----------------------------------------------------------------
+          echo "=== Step 5: Restarting MongoDB with authentication ==="
+
+          mongod --shutdown --dbpath /var/lib/mongo || true
+
+          echo "Fixing MongoDB data directory permissions..."
+          chown -R mongod:mongod /var/lib/mongo
+          chmod 755 /var/lib/mongo
+
+          echo "Waiting for mongod to stop..."
+          STOP_WAIT=0
+          while pgrep -x mongod > /dev/null 2>&1; do
+            sleep 1
+            STOP_WAIT=$((STOP_WAIT + 1))
+            if [ $STOP_WAIT -ge 30 ]; then
+              echo "mongod still running after 30s - force killing..."
+              pkill -9 -x mongod || true
+              sleep 2
+              break
+            fi
+          done
+          echo "mongod stopped after ${!STOP_WAIT}s"
+
+          rm -f /var/lib/mongo/mongod.lock
+          rm -f /var/lib/mongo/.lock
+          rm -f /var/run/mongodb/mongod.pid
+
+          mkdir -p /var/run/mongodb
+          chown mongod:mongod /var/run/mongodb
+          chmod 755 /var/run/mongodb
+
+          echo "Starting mongod via systemd..."
+          systemctl enable mongod
+          systemctl start mongod
+
+          sleep 3
+
+          echo "Waiting for authenticated MongoDB to be stable..."
+          MONGO_AUTH_READY=false
+          for AUTH_WAIT in $(seq 1 60); do
+            MONGOD_STATUS=$(systemctl is-active mongod 2>/dev/null || echo "unknown")
+
+            if [ "$MONGOD_STATUS" = "active" ]; then
+              if mongo \
+                --quiet \
+                --eval "db.adminCommand('ping').ok" \
+                "mongodb://${!TASKY_USER}:${!TASKY_PASS}@localhost:27017/${MongoDBDatabaseName}?authSource=admin" \
+                2>/dev/null | grep -q "1"; then
+                echo "MongoDB stable and accepting auth connections after ${!AUTH_WAIT}s"
+                MONGO_AUTH_READY=true
+                sleep 2
+                if systemctl is-active --quiet mongod; then
+                  echo "MongoDB confirmed stable after additional 2s check"
+                  break
+                else
+                  echo "MongoDB crashed after initial success - continuing to wait..."
+                  MONGO_AUTH_READY=false
+                fi
+              fi
+            else
+              if [ $((AUTH_WAIT % 5)) -eq 0 ]; then
+                echo "mongod status: $MONGOD_STATUS after ${!AUTH_WAIT}s"
+                journalctl -u mongod --no-pager -n 3 2>/dev/null || true
+              fi
+            fi
+            sleep 1
+          done
+
+          if [ "$MONGO_AUTH_READY" = "false" ]; then
+            echo "ERROR: MongoDB failed to achieve stable state"
+            systemctl status mongod --no-pager 2>/dev/null || true
+            journalctl -u mongod --no-pager -n 20 2>/dev/null || true
+            tail -20 /var/log/mongodb/mongod.log 2>/dev/null || true
+            BOOTSTRAP_EXIT_CODE=1
+          fi
+
+          echo "Step 5 complete - MongoDB status: $(systemctl is-active mongod)"
+
+          # -----------------------------------------------------------------
+          # Step 6: Configure S3 backup script
+          # -----------------------------------------------------------------
+          echo "=== Step 6: Configuring MongoDB S3 backup ==="
+
+          cat > /usr/local/bin/mongodb-backup.sh << 'BACKUPSCRIPT'
+          #!/bin/bash
+          set -e
+          exec > >(logger -t mongodb-backup -s 2>/dev/console) 2>&1
+
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          BACKUP_FILE="go-mongodb-${!TIMESTAMP}.gz"
+          S3_BUCKET="BACKUP_BUCKET_PLACEHOLDER"
+          MONGODB_URI="MONGODB_URI_PLACEHOLDER"
+          AWS_REGION="REGION_PLACEHOLDER"
+
+          echo "Starting MongoDB backup: ${!TIMESTAMP}"
+
+          mongodump \
+            --uri="${!MONGODB_URI}" \
+            --db=go-mongodb \
+            --gzip \
+            --archive \
+            | aws s3 cp - \
+                "s3://${!S3_BUCKET}/backups/${!BACKUP_FILE}" \
+                --region "${!AWS_REGION}" \
+                --storage-class STANDARD
+
+          echo "Backup completed: s3://${!S3_BUCKET}/backups/${!BACKUP_FILE}"
+
+          aws s3 ls "s3://${!S3_BUCKET}/backups/${!BACKUP_FILE}" \
+            --region "${!AWS_REGION}"
+
+          echo "Backup verification successful"
+          BACKUPSCRIPT
+
+          sed -i "s|BACKUP_BUCKET_PLACEHOLDER|${BackupBucketName}|g" \
+            /usr/local/bin/mongodb-backup.sh
+          sed -i "s|MONGODB_URI_PLACEHOLDER|mongodb://${!TASKY_USER}:${!TASKY_PASS}@localhost:27017/${MongoDBDatabaseName}?authSource=admin|g" \
+            /usr/local/bin/mongodb-backup.sh
+          sed -i "s|REGION_PLACEHOLDER|${AWS::Region}|g" \
+            /usr/local/bin/mongodb-backup.sh
+
+          chmod +x /usr/local/bin/mongodb-backup.sh
+
+          echo "0 2 * * * root /usr/local/bin/mongodb-backup.sh >> /var/log/mongodb-backup.log 2>&1" \
+            > /etc/cron.d/mongodb-backup
+
+          systemctl enable crond
+          systemctl start crond
+
+          # -----------------------------------------------------------------
+          # Step 7: Final verification
+          # -----------------------------------------------------------------
+          echo "=== Step 7: Final verification ==="
+          echo "MongoDB version: $(mongod --version)"
+          echo "MongoDB status: $(systemctl is-active mongod)"
+          echo "Cron status: $(systemctl is-active crond)"
+
+          BOOTSTRAP_EXIT_CODE=0
+          if ! systemctl is-active --quiet mongod; then
+            echo "ERROR: MongoDB is not running at time of cfn-signal"
+            BOOTSTRAP_EXIT_CODE=1
+          fi
+
+          echo "=== WizTT MongoDB Bootstrap Complete ==="
+          echo "Timestamp: $(date)"
+          echo "Exit code for cfn-signal: $BOOTSTRAP_EXIT_CODE"
+
+          # -----------------------------------------------------------------
+          # Step 8: Signal CloudFormation
+          # -----------------------------------------------------------------
+          /opt/aws/bin/cfn-signal -e $BOOTSTRAP_EXIT_CODE \
+            --stack ${AWS::StackName} \
+            --resource MongoDBInstance \
+            --region ${AWS::Region}
+
+          echo "cfn-signal sent with exit code: $BOOTSTRAP_EXIT_CODE"
+
+          # -----------------------------------------------------------------
+          # Step 9: Post-signal tasks
+          # -----------------------------------------------------------------
+          echo "=== Step 9: Post-signal tasks ==="
+
+          echo "Running initial backup verification..."
+          /usr/local/bin/mongodb-backup.sh && \
+            echo "Initial backup completed successfully" || \
+            echo "WARNING: Initial backup failed - check /var/log/mongodb-backup.log"
+
+          echo "=== All post-signal tasks complete ==="
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mongodb-ec2"
+        - Key: Purpose
+          Value: "MongoDB-Database-Server"
+        - Key: SecurityWeakness
+          Value: "Outdated-OS-SSH-Exposed-Overpermissive-IAM"
+        - Key: MongoDBVersion
+          Value: !Ref MongoDBVersion
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT20M
+
+  # ===========================================================================
+  # SECTION 3.4: KUBERNETES MASTER NODE
+  # ===========================================================================
+  K8sMasterInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - MongoDBInstance
+      - CalicoInstallationParameter
+      - K8sRepoFileParameter
+      - K8sMasterLogGroup
+    Properties:
+      ImageId: !Ref K8sAMI
+      InstanceType: !Ref K8sMasterInstanceType
+      SubnetId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-PrivateSubnet1Id"
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: "${EnvironmentName}-K8sMasterInstanceProfileName"
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-K8sMasterSecurityGroupId"
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # =================================================================
+          # Kubernetes Master Node Bootstrap Script
+          # =================================================================
+          set -e
+          exec > >(tee /var/log/k8s-master-bootstrap.log | logger -t k8s-master -s 2>/dev/console) 2>&1
+
+          echo "=== WizTT K8s Master Bootstrap Started ==="
+          echo "Timestamp: $(date)"
+
+          IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+          PRIVATE_IP=$(curl -s \
+            -H "X-aws-ec2-metadata-token: ${!IMDS_TOKEN}" \
+            http://169.254.169.254/latest/meta-data/local-ipv4)
+
+          INSTANCE_ID=$(curl -s \
+            -H "X-aws-ec2-metadata-token: ${!IMDS_TOKEN}" \
+            http://169.254.169.254/latest/meta-data/instance-id)
+
+          [ -z "$INSTANCE_ID" ] && INSTANCE_ID="unknown"
+          echo "Instance ID: $INSTANCE_ID"
+          echo "Private IP:  $PRIVATE_IP"
+
+          if [ -z "$PRIVATE_IP" ]; then
+            echo "ERROR: Could not retrieve Private IP from IMDS"
+            exit 1
+          fi
+
+          # -----------------------------------------------------------------
+          # Step 1: Update OS
+          # -----------------------------------------------------------------
+          echo "=== Step 1: Updating OS ==="
+          dnf update -y
+          dnf install -y \
+            wget git jq tar socat conntrack \
+            ipset ipvsadm nfs-utils amazon-cloudwatch-agent
+          dnf install -y aws-cfn-bootstrap
+
+          # -----------------------------------------------------------------
+          # Step 2: Disable swap
+          # -----------------------------------------------------------------
+          echo "=== Step 2: Disabling swap ==="
+          swapoff -a
+          sed -i '/swap/d' /etc/fstab
+
+          # -----------------------------------------------------------------
+          # Step 3: Load kernel modules
+          # -----------------------------------------------------------------
+          printf 'overlay\nbr_netfilter\nnf_conntrack\n' \
+            > /etc/modules-load.d/k8s.conf
+          modprobe overlay
+          modprobe br_netfilter
+          modprobe nf_conntrack
+
+          # -----------------------------------------------------------------
+          # Step 4: Configure sysctl
+          # -----------------------------------------------------------------
+          echo "=== Step 4: Configuring sysctl ==="
+          printf '%s\n' \
+            'net.bridge.bridge-nf-call-iptables = 1' \
+            'net.bridge.bridge-nf-call-ip6tables = 1' \
+            'net.ipv4.ip_forward = 1' \
+            'net.netfilter.nf_conntrack_max = 131072' \
+            > /etc/sysctl.d/k8s.conf
+          sysctl --system || true
+
+          SYSCTL_OK=true
+          for param in \
+            "net.bridge.bridge-nf-call-iptables" \
+            "net.bridge.bridge-nf-call-ip6tables" \
+            "net.ipv4.ip_forward" \
+            "net.netfilter.nf_conntrack_max"; do
+            value=$(sysctl -n "$param" 2>/dev/null || echo "MISSING")
+            echo "  $param = $value"
+            if [ "$value" = "MISSING" ] || [ "$value" = "0" ]; then
+              SYSCTL_OK=false
+            fi
+          done
+
+          if [ "$SYSCTL_OK" = "false" ]; then
+            echo "ERROR: One or more critical sysctl settings failed to apply"
+            exit 1
+          fi
+
+          # -----------------------------------------------------------------
+          # Step 5: Install containerd
+          # -----------------------------------------------------------------
+          echo "=== Step 5: Installing containerd ==="
+          dnf install -y containerd
+          mkdir -p /etc/containerd
+          containerd config default > /etc/containerd/config.toml
+          sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' \
+            /etc/containerd/config.toml
+          grep -q "SystemdCgroup = true" /etc/containerd/config.toml || {
+            echo "ERROR: SystemdCgroup = true not found after sed replacement"
+            exit 1
+          }
+          systemctl enable containerd
+          systemctl start containerd
+
+          if ! systemctl is-active --quiet containerd; then
+            echo "ERROR: containerd failed to start"
+            journalctl -u containerd --no-pager -n 20
+            exit 1
+          fi
+
+          # -----------------------------------------------------------------
+          # Step 6: Install kubeadm, kubelet, kubectl
+          # -----------------------------------------------------------------
+          echo "=== Step 6: Installing Kubernetes ${KubernetesVersion} ==="
+
+          aws ssm get-parameter \
+            --name "/${EnvironmentName}/k8s/config/kubernetes-repo" \
+            --query "Parameter.Value" \
+            --output text \
+            --region ${AWS::Region} \
+            > /etc/yum.repos.d/kubernetes.repo
+
+          dnf install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+          systemctl enable kubelet
+
+          K8S_FULL_VERSION=$(kubelet --version | awk '{print $2}')
+          echo "Installed Kubernetes version: $K8S_FULL_VERSION"
+
+          [[ "$K8S_FULL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "ERROR: Unexpected kubelet version format: $K8S_FULL_VERSION"
+            exit 1
+          }
+
+          # -----------------------------------------------------------------
+          # Step 7: Initialize Kubernetes cluster
+          # -----------------------------------------------------------------
+          echo "=== Step 7: Initializing K8s cluster with kubeadm ==="
+
+          kubeadm config images pull \
+            --kubernetes-version="$K8S_FULL_VERSION" \
+            --cri-socket=unix:///run/containerd/containerd.sock
+
+          kubeadm init \
+            --pod-network-cidr=${PodNetworkCidr} \
+            --apiserver-advertise-address="$PRIVATE_IP" \
+            --kubernetes-version="$K8S_FULL_VERSION" \
+            --node-name="$(hostname -s)" \
+            --cri-socket=unix:///run/containerd/containerd.sock \
+            > /var/log/kubeadm-init.log 2>&1
+
+          KUBEADM_EXIT=$?
+          if [ "$KUBEADM_EXIT" -ne 0 ]; then
+            echo "ERROR: kubeadm init failed with exit code $KUBEADM_EXIT"
+            tail -30 /var/log/kubeadm-init.log
+            exit "$KUBEADM_EXIT"
+          fi
+
+          if [ ! -f /etc/kubernetes/admin.conf ]; then
+            echo "ERROR: /etc/kubernetes/admin.conf missing after kubeadm init"
+            exit 1
+          fi
+
+          # -----------------------------------------------------------------
+          # Step 8: Configure kubectl
+          # -----------------------------------------------------------------
+          echo "=== Step 8: Configuring kubectl ==="
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+
+          mkdir -p /root/.kube
+          cp /etc/kubernetes/admin.conf /root/.kube/config
+          chown root:root /root/.kube/config
+          echo 'export KUBECONFIG=/etc/kubernetes/admin.conf' >> /root/.bashrc
+
+          mkdir -p /home/ec2-user/.kube
+          cp /etc/kubernetes/admin.conf /home/ec2-user/.kube/config
+          chown -R ec2-user:ec2-user /home/ec2-user/.kube
+
+          echo "Waiting for Kubernetes API server to be ready..."
+          API_READY=false
+          for i in $(seq 1 30); do
+            if kubectl cluster-info &>/dev/null; then
+              echo "API server ready after ${!i}s"
+              API_READY=true
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "$API_READY" = "false" ]; then
+            echo "ERROR: Kubernetes API server not ready after 150s"
+            exit 1
+          fi
+
+          kubectl get nodes
+          kubectl get pods -n kube-system
+
+          # -----------------------------------------------------------------
+          # Step 9: Install Calico CNI
+          # -----------------------------------------------------------------
+          echo "=== Step 9: Installing Calico CNI ==="
+
+          kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/${CalicoVersion}/manifests/tigera-operator.yaml
+
+          echo "Waiting for tigera-operator to be ready..."
+          kubectl wait --for=condition=Available \
+            deployment/tigera-operator \
+            -n tigera-operator \
+            --timeout=120s
+
+          echo "Waiting for Calico CRDs to be registered..."
+          until kubectl get crd installations.operator.tigera.io &>/dev/null; do
+            echo "  CRDs not ready yet, waiting 5s..."
+            sleep 5
+          done
+
+          aws ssm get-parameter \
+            --name "/${EnvironmentName}/k8s/config/calico-installation" \
+            --query "Parameter.Value" \
+            --output text \
+            --region ${AWS::Region} \
+            > /tmp/calico-config.yaml
+
+          sed -i "s|POD_CIDR_PLACEHOLDER|${PodNetworkCidr}|g" /tmp/calico-config.yaml
+          kubectl create -f /tmp/calico-config.yaml
+
+          kubectl wait --for=condition=Ready \
+            pods -l k8s-app=calico-node \
+            -n calico-system \
+            --timeout=300s || true
+
+          kubectl wait --for=condition=Ready \
+            node/$(hostname -s) \
+            --timeout=300s
+
+          echo "Calico CNI installed and master node is Ready"
+
+          # -----------------------------------------------------------------
+          # Step 10: Store kubeadm join command in SSM
+          # -----------------------------------------------------------------
+          echo "=== Step 10: Storing kubeadm join command in SSM ==="
+
+          JOIN_COMMAND=$(kubeadm token create --print-join-command)
+
+          aws ssm put-parameter \
+            --name "/${EnvironmentName}/k8s/join-command" \
+            --value "$JOIN_COMMAND" \
+            --type SecureString \
+            --overwrite \
+            --region ${AWS::Region}
+
+          KUBECONFIG_B64=$(base64 -w 0 /etc/kubernetes/admin.conf)
+          aws ssm put-parameter \
+            --name "/${EnvironmentName}/k8s/admin-kubeconfig" \
+            --value "$KUBECONFIG_B64" \
+            --type SecureString \
+            --tier Advanced \
+            --overwrite \
+            --region ${AWS::Region}
+
+          echo "Join command and kubeconfig stored in SSM"
+
+          # -----------------------------------------------------------------
+          # Step 11: Final verification and CloudFormation signal
+          # -----------------------------------------------------------------
+          echo "=== Step 11: Final verification ==="
+          kubectl get nodes
+
+          BOOTSTRAP_EXIT_CODE=0
+          if ! kubectl get nodes &>/dev/null; then
+            echo "ERROR: kubectl not functional at cfn-signal time"
+            BOOTSTRAP_EXIT_CODE=1
+          fi
+
+          echo "=== WizTT K8s Master Bootstrap Complete ==="
+          echo "Timestamp: $(date)"
+
+          /opt/aws/bin/cfn-signal -e "$BOOTSTRAP_EXIT_CODE" \
+            --stack ${AWS::StackName} \
+            --resource K8sMasterInstance \
+            --region ${AWS::Region}
+
+          echo "cfn-signal sent"
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-k8s-master"
+        - Key: Purpose
+          Value: "K8s-Control-Plane"
+        - Key: KubernetesVersion
+          Value: !Ref KubernetesVersion
+        - Key: KubernetesRole
+          Value: "master"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT25M
+
+  # ===========================================================================
+  # SECTION 3.5: KUBERNETES WORKER NODE
+  # ===========================================================================
+  K8sWorkerInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - K8sMasterInstance
+      - K8sWorkerLogGroup
+    Properties:
+      ImageId: !Ref K8sAMI
+      InstanceType: !Ref K8sWorkerInstanceType
+      SubnetId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-PrivateSubnet1Id"
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: "${EnvironmentName}-K8sWorkerInstanceProfileName"
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-K8sWorkerSecurityGroupId"
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # =================================================================
+          # Kubernetes Worker Node Bootstrap Script
+          # =================================================================
+          set -e
+          exec > >(tee /var/log/k8s-worker-bootstrap.log | logger -t k8s-worker -s 2>/dev/console) 2>&1
+
+          echo "=== WizTT K8s Worker Bootstrap Started ==="
+          echo "Timestamp: $(date)"
+
+          IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+          WORKER_PRIVATE_IP=$(curl -s \
+            -H "X-aws-ec2-metadata-token: ${!IMDS_TOKEN}" \
+            http://169.254.169.254/latest/meta-data/local-ipv4)
+
+          INSTANCE_ID=$(curl -s \
+            -H "X-aws-ec2-metadata-token: ${!IMDS_TOKEN}" \
+            http://169.254.169.254/latest/meta-data/instance-id)
+
+          [ -z "$INSTANCE_ID" ] && INSTANCE_ID="unknown"
+          echo "Instance ID: $INSTANCE_ID"
+          echo "Worker Private IP: $WORKER_PRIVATE_IP"
+
+          # Steps 1-6: Mirror master node OS and runtime preparation
+          echo "=== Steps 1-6: OS and runtime preparation ==="
+
+          dnf update -y
+          dnf install -y wget git jq tar socat conntrack \
+            ipset ipvsadm nfs-utils amazon-cloudwatch-agent
+          dnf install -y aws-cfn-bootstrap
+
+          swapoff -a
+          sed -i '/swap/d' /etc/fstab
+
+          printf 'overlay\nbr_netfilter\nnf_conntrack\n' \
+            > /etc/modules-load.d/k8s.conf
+          modprobe overlay
+          modprobe br_netfilter
+          modprobe nf_conntrack
+
+          printf '%s\n' \
+            'net.bridge.bridge-nf-call-iptables = 1' \
+            'net.bridge.bridge-nf-call-ip6tables = 1' \
+            'net.ipv4.ip_forward = 1' \
+            'net.netfilter.nf_conntrack_max = 131072' \
+            > /etc/sysctl.d/k8s.conf
+          sysctl --system || true
+
+          dnf install -y containerd
+          mkdir -p /etc/containerd
+          containerd config default > /etc/containerd/config.toml
+          sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' \
+            /etc/containerd/config.toml
+          systemctl enable containerd
+          systemctl start containerd
+
+          aws ssm get-parameter \
+            --name "/${EnvironmentName}/k8s/config/kubernetes-repo" \
+            --query "Parameter.Value" \
+            --output text \
+            --region ${AWS::Region} \
+            > /etc/yum.repos.d/kubernetes.repo
+
+          dnf install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+          systemctl enable kubelet
+
+          echo "OS and runtime preparation complete"
+
+          # -----------------------------------------------------------------
+          # Step 7: Poll SSM for kubeadm join command
+          # -----------------------------------------------------------------
+          echo "=== Step 7: Waiting for kubeadm join command from master ==="
+
+          MAX_ATTEMPTS=80
+          ATTEMPT=0
+          JOIN_COMMAND=""
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Polling SSM for join command (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
+
+            JOIN_COMMAND=$(aws ssm get-parameter \
+              --name "/${EnvironmentName}/k8s/join-command" \
+              --with-decryption \
+              --query "Parameter.Value" \
+              --output text \
+              --region ${AWS::Region} 2>/dev/null || echo "")
+
+            if [ -n "$JOIN_COMMAND" ] && [ "$JOIN_COMMAND" != "None" ]; then
+              echo "Join command retrieved from SSM"
+              break
+            fi
+
+            echo "Join command not yet available, waiting 15 seconds..."
+            sleep 15
+          done
+
+          if [ -z "$JOIN_COMMAND" ] || [ "$JOIN_COMMAND" = "None" ]; then
+            echo "ERROR: Timed out waiting for kubeadm join command from master"
+            exit 1
+          fi
+
+          # -----------------------------------------------------------------
+          # Step 8: Join the Kubernetes cluster
+          # -----------------------------------------------------------------
+          echo "=== Step 8: Joining Kubernetes cluster ==="
+
+          eval "$JOIN_COMMAND --cri-socket=unix:///run/containerd/containerd.sock" \
+            2>&1 | tee /var/log/kubeadm-join.log
+
+          echo "kubeadm join completed"
+
+          sleep 10
+          if systemctl is-active --quiet kubelet; then
+            echo "kubelet is running - worker node joined cluster successfully"
+          else
+            echo "ERROR: kubelet is not running after join"
+            systemctl status kubelet
+            exit 1
+          fi
+
+          # -----------------------------------------------------------------
+          # Step 9: Final verification and CloudFormation signal
+          # -----------------------------------------------------------------
+          echo "=== Step 9: Final verification ==="
+          echo "kubelet status: $(systemctl is-active kubelet)"
+          echo "containerd status: $(systemctl is-active containerd)"
+          echo "Worker IP: $WORKER_PRIVATE_IP"
+
+          echo "=== WizTT K8s Worker Bootstrap Complete ==="
+          echo "Timestamp: $(date)"
+
+          BOOTSTRAP_EXIT_CODE=0
+          if ! systemctl is-active --quiet kubelet; then
+            BOOTSTRAP_EXIT_CODE=1
+          fi
+
+          /opt/aws/bin/cfn-signal -e $BOOTSTRAP_EXIT_CODE \
+            --stack ${AWS::StackName} \
+            --resource K8sWorkerInstance \
+            --region ${AWS::Region}
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-k8s-worker"
+        - Key: Purpose
+          Value: "K8s-Worker-Node"
+        - Key: KubernetesVersion
+          Value: !Ref KubernetesVersion
+        - Key: KubernetesRole
+          Value: "worker"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT25M
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+
+  # MongoDB
+  MongoDBInstanceId:
+    Description: "MongoDB EC2 Instance ID"
+    Value: !Ref MongoDBInstance
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBInstanceId"
+
+  MongoDBPrivateIP:
+    Description: "MongoDB EC2 Private IP Address"
+    Value: !GetAtt MongoDBInstance.PrivateIp
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBPrivateIP"
+
+  MongoDBPublicIP:
+    Description: "MongoDB EC2 Public IP Address (auto-assigned from public subnet)"
+    Value: !GetAtt MongoDBInstance.PublicIp
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBPublicIP"
+
+  MongoDBBackupBucketName:
+    Description: "MongoDB S3 Backup Bucket Name (public read+list - intentional weakness)"
+    Value: !Ref MongoDBBackupBucket
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBBackupBucketName"
+
+  MongoDBBackupBucketArn:
+    Description: "MongoDB S3 Backup Bucket ARN"
+    Value: !GetAtt MongoDBBackupBucket.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBBackupBucketArn"
+
+  CloudTrailLogsBucketName:
+    Description: "CloudTrail Logs S3 Bucket Name (private, encrypted)"
+    Value: !Ref CloudTrailLogsBucket
+    Export:
+      Name: !Sub "${EnvironmentName}-CloudTrailLogsBucketName"
+
+  CloudTrailLogsBucketArn:
+    Description: "CloudTrail Logs S3 Bucket ARN"
+    Value: !GetAtt CloudTrailLogsBucket.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-CloudTrailLogsBucketArn"
+
+  MongoAdminCredentialsSecretArn:
+    Description: "ARN of MongoDB admin credentials secret (mongoadmin)"
+    Value: !Ref MongoAdminCredentialsSecret
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoAdminCredentialsSecretArn"
+
+  TaskyMongoCredentialsSecretArn:
+    Description: "ARN of Tasky MongoDB app credentials secret"
+    Value: !Ref TaskyMongoCredentialsSecret
+    Export:
+      Name: !Sub "${EnvironmentName}-TaskyMongoCredentialsSecretArn"
+
+  MongoDBURISecretArn:
+    Description: "MongoDB URI components secret ARN in AWS Secrets Manager"
+    Value: !Ref MongoDBURISecret
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBURISecretArn"
+
+  JWTSecretKeyArn:
+    Description: "JWT Secret Key ARN in AWS Secrets Manager"
+    Value: !Ref JWTSecretKeySecret
+    Export:
+      Name: !Sub "${EnvironmentName}-JWTSecretKeyArn"
+
+  # K8s Master
+  K8sMasterInstanceId:
+    Description: "K8s Master EC2 Instance ID"
+    Value: !Ref K8sMasterInstance
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sMasterInstanceId"
+
+  K8sMasterPrivateIP:
+    Description: "K8s Master EC2 Private IP Address"
+    Value: !GetAtt K8sMasterInstance.PrivateIp
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sMasterPrivateIP"
+
+  # K8s Worker
+  K8sWorkerInstanceId:
+    Description: "K8s Worker EC2 Instance ID"
+    Value: !Ref K8sWorkerInstance
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sWorkerInstanceId"
+
+  K8sWorkerPrivateIP:
+    Description: "K8s Worker EC2 Private IP Address"
+    Value: !GetAtt K8sWorkerInstance.PrivateIp
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sWorkerPrivateIP"
+
+  # CloudWatch Log Groups
+  K8sMasterLogGroupName:
+    Description: "K8s Master Node CloudWatch Log Group Name"
+    Value: !Ref K8sMasterLogGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sMasterLogGroupName"
+
+  K8sWorkerLogGroupName:
+    Description: "K8s Worker Node CloudWatch Log Group Name"
+    Value: !Ref K8sWorkerLogGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sWorkerLogGroupName"

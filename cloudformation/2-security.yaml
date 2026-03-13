@@ -1,0 +1,1041 @@
+# =============================================================================
+# WizTT - Stack 2: Security Groups & IAM Roles
+# =============================================================================
+# Description:
+#   Defines all Security Groups and IAM Roles/Policies for the demo
+#   environment. This stack must be deployed after Stack 1 (Networking)
+#   as it imports VPC and subnet outputs from that stack.
+#
+# Deployment Order: 2 of 5
+# Depends On:      Stack 1 (VPC & Networking Foundation)
+# Exports To:      Stack 3 (Compute), Stack 4 (Observability)
+#
+# Resources Created:
+#   Security Groups:
+#     - ALB Security Group
+#     - K8s Master Node Security Group
+#     - K8s Worker Node Security Group
+#     - MongoDB EC2 Security Group
+#
+#   IAM Roles & Instance Profiles:
+#     - MongoDB EC2 Role (intentionally over-permissioned)
+#     - K8s Master Node Role (LB Controller + EC2 Describe)
+#     - K8s Worker Node Role (LB Controller + Secrets Manager)
+#
+#   IAM Policies:
+#     - AWS Load Balancer Controller Policy (scoped, not elasticloadbalancing:*)
+#     - MongoDB Backup Policy (S3 write to backup bucket)
+#     - MongoDB Overpermissive Policy (intentional weakness: ec2:*)
+#     - K8s Worker Secrets Policy (Secrets Manager read for ESO)
+#     - S3/SSM Access
+#
+# Intentional Security Weaknesses (required by the exercise):
+#   - MongoDB EC2 Role: granted ec2:* (ability to create EC2 instances)
+#   - MongoDB SG: SSH (port 22) open to 0.0.0.0/0
+#
+# CI/CD Notes:
+#   - Imports cross-stack references from Stack 1 using !ImportValue
+#   - All SG and IAM resource IDs exported for Stack 3 consumption
+#   - AdminCidrIp parameter should be set per-environment in pipeline
+#     parameter files (not hardcoded in template)
+#
+# Last Updated:    2026-03-03
+# Version:         1.0.0
+# =============================================================================
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  WizTT Stack 2/5 - Security Groups & IAM Roles.
+  Deploys all security groups controlling network access between
+  components, and IAM roles/policies governing AWS API permissions
+  for all EC2 instances in the WizTT environment.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - EnvironmentName
+          - ProjectName
+      - Label:
+          default: "Network Access Configuration"
+        Parameters:
+          - MongoDBPort
+          - NodePort
+
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      MongoDBPort:
+        default: "MongoDB Port"
+      NodePort:
+        default: "K8s NodePort for ALB Target Group"
+
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  # ---------------------------------------------------------------------------
+  # Environment Configuration
+  # ---------------------------------------------------------------------------
+  EnvironmentName:
+    Type: String
+    Default: demo
+    AllowedValues:
+      - demo
+      - dev
+      - staging
+      - prod
+    Description: >
+      Must match the EnvironmentName used in Stack 1 (Networking).
+      Used to construct cross-stack import names and resource naming.
+
+  ProjectName:
+    Type: String
+    Default: WizTT
+    Description: Project name for resource tagging.
+
+  # ---------------------------------------------------------------------------
+  # Network Access Configuration
+  # ---------------------------------------------------------------------------
+
+  MongoDBPort:
+    Type: Number
+    Default: 27017
+    MinValue: 1024
+    MaxValue: 65535
+    Description: >
+      MongoDB listening port. Default 27017 is the standard MongoDB port.
+      Access is restricted to K8s Worker Node SG only (not public internet)
+      despite MongoDB EC2 being in a public subnet.
+
+
+  NodePort:
+    Type: Number
+    Default: 30080
+    MinValue: 30000
+    MaxValue: 32767
+    Description: >
+      Kubernetes NodePort used to expose the Tasky service externally.
+      Must be in the K8s NodePort range (30000-32767).
+      The ALB Target Group will forward traffic to this port on
+      K8s worker nodes. Must match the K8s Service manifest.
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # SECTION 2.1: SECURITY GROUPS
+  # ===========================================================================
+  # Security Group dependency chain:
+  #   ALB-SG → (referenced in) → K8s-Worker-SG
+  #   K8s-Worker-SG → (referenced in) → MongoDB-SG
+  #   K8s-Master-SG ↔ K8s-Worker-SG (mutual references via separate rules)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Section 2.1.1: ALB Security Group
+  # ---------------------------------------------------------------------------
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-alb-sg"
+      GroupDescription: "ALB SG - allows inbound HTTPS (443) and HTTP (80) from internet. HTTP redirected to HTTPS by ALB listener. Outbound restricted to K8s worker NodePort only."
+      VpcId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-VPCId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "HTTPS inbound from public internet - primary app access"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "HTTP inbound from public internet - redirected to HTTPS by ALB listener rule"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb-sg"
+        - Key: Purpose
+          Value: "Application-Load-Balancer"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Outbound restricted to NodePort on K8s worker nodes only
+  ALBSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref NodePort
+      ToPort: !Ref NodePort
+      DestinationSecurityGroupId: !Ref K8sWorkerSecurityGroup
+      Description: "Outbound to K8s worker NodePort"
+
+
+  # ---------------------------------------------------------------------------
+  # Section 2.1.2: K8s Master Node Security Group
+  # ---------------------------------------------------------------------------
+  # Controls traffic to/from the Kubernetes control plane (master node).
+  #
+  # Required ports for self-managed K8s control plane:
+  #   6443  - Kubernetes API server (kubectl + worker node registration)
+  #   2379  - etcd client (API server reads cluster state)
+  #   2380  - etcd peer (etcd cluster communication, unused w/ single master
+  #           but required by kubeadm for future expansion)
+  #   10250 - kubelet API (master reads worker node metrics/logs)
+  #   10257 - kube-controller-manager (health checks)
+  #   10259 - kube-scheduler (health checks)
+  # ---------------------------------------------------------------------------
+  K8sMasterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-k8s-master-sg"
+      GroupDescription: "K8s Master Node SG - restricts API server access to worker nodes. etcd restricted to master self-reference (single master setup)."
+      VpcId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-VPCId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: "Allow all outbound - required for control plane operations and bootstrap"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-k8s-master-sg"
+        - Key: Purpose
+          Value: "K8s-Control-Plane"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  K8sMasterEtcdClientIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sMasterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2379
+      ToPort: 2380
+      SourceSecurityGroupId: !Ref K8sMasterSecurityGroup
+      Description: "etcd server client API - m2m"
+
+  K8sMasterKubeletFromMasterIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sMasterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 10250
+      ToPort: 10250
+      SourceSecurityGroupId: !Ref K8sMasterSecurityGroup
+      Description: "kubelet API - m2m"
+
+  K8sMasterControllerManagerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sMasterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 10257
+      ToPort: 10257
+      SourceSecurityGroupId: !Ref K8sMasterSecurityGroup
+      Description: "kube-controller-manager - m2m"
+
+  K8sMasterSchedulerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sMasterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 10259
+      ToPort: 10259
+      SourceSecurityGroupId: !Ref K8sMasterSecurityGroup
+      Description: "kube-schedulerk - m2m"
+  
+  K8sMasterVXLANFromMasterIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sMasterSecurityGroup
+      IpProtocol: udp
+      FromPort: 4789
+      ToPort: 4789
+      SourceSecurityGroupId: !Ref K8sMasterSecurityGroup
+      Description: "Calico VXLAN encapsulation - master to master"
+  
+    # Worker → Master: API server (worker registers with and reports to master)
+  K8sMasterAPIFromWorkerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sMasterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6443
+      ToPort: 6443
+      CidrIp: !ImportValue
+        Fn::Sub: "${EnvironmentName}-VPCCidr"
+      Description: "K8s API server - worker node registration and control plane communication"
+
+  # ---------------------------------------------------------------------------
+  # Section 2.1.3: K8s Worker Node Security Group
+  # ---------------------------------------------------------------------------
+  # Controls traffic to/from Kubernetes worker nodes.
+  #
+  # Required ports for self-managed K8s worker nodes:
+  #   10250      - kubelet API (master reads worker metrics/exec/logs)
+  #   30000-32767 - NodePort range (ALB forwards to exposed services)
+  #
+  # Calico CNI additional requirements (added as separate ingress rules):
+  #   4789 - VXLAN (Calico encapsulated pod network traffic)
+  #   All traffic between worker nodes (pod-to-pod communication)
+  # ---------------------------------------------------------------------------
+  K8sWorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-k8s-worker-sg"
+      GroupDescription: "K8s Worker Node SG - accepts NodePort traffic from ALB and kubelet from master."
+      VpcId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-VPCId"
+      SecurityGroupIngress:
+        # NodePort range - ALB forwards HTTPS traffic to Tasky on NodePort
+        # Restricted to VPC CIDR (ALB is within VPC) not 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: !Ref NodePort
+          ToPort: !Ref NodePort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup          
+          Description: "K8s NodePort range - accepts traffic from ALB within VPC only"
+        - IpProtocol: udp
+          FromPort: !Ref NodePort
+          ToPort: !Ref NodePort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup          
+          Description: "K8s NodePort range - accepts traffic from ALB within VPC only"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: "Allow all outbound connections"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-k8s-worker-sg"
+        - Key: Purpose
+          Value: "K8s-Worker-Node"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Master → Worker: kubelet API (master executes commands on worker pods)
+  K8sWorkerKubeletFromMasterIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sWorkerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 10250
+      ToPort: 10250
+      SourceSecurityGroupId: !Ref K8sMasterSecurityGroup
+      Description: "kubelet API - K8s master reads worker metrics, exec, and logs"
+
+  # Calico VXLAN: encapsulated pod network traffic between nodes
+  K8sWorkerVXLANFromMasterIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sWorkerSecurityGroup
+      IpProtocol: udp
+      FromPort: 4789
+      ToPort: 4789
+      SourceSecurityGroupId: !Ref K8sMasterSecurityGroup
+      Description: "Calico VXLAN encapsulation - pod network traffic from master"
+
+  K8sWorkerVXLANFromWorkerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sWorkerSecurityGroup
+      IpProtocol: udp
+      FromPort: 4789
+      ToPort: 4789
+      SourceSecurityGroupId: !Ref K8sWorkerSecurityGroup
+      Description: "Calico VXLAN encapsulation - worker to worker"
+
+  K8sMasterVXLANFromWorkerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sMasterSecurityGroup
+      IpProtocol: udp
+      FromPort: 4789
+      ToPort: 4789
+      SourceSecurityGroupId: !Ref K8sWorkerSecurityGroup
+      Description: "Calico VXLAN encapsulation - pod network traffic from worker"
+
+  K8sMasterTypharomWorkerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sMasterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5473
+      ToPort: 5473
+      SourceSecurityGroupId: !Ref K8sWorkerSecurityGroup
+      Description: "Calico Typha - pod network traffic from worker"
+  
+  # ---------------------------------------------------------------------------
+  # Section 2.1.4: MongoDB EC2 Security Group
+  # ---------------------------------------------------------------------------
+  # INTENTIONAL SECURITY WEAKNESSES (required by Wiz exercise):
+  #   1. SSH (port 22) open to 0.0.0.0/0 - exposes management port to internet
+  #      This is a critical finding Wiz should detect and surface.
+  #      Real-world risk: brute force attacks, credential stuffing,
+  #      exploitation of SSH vulnerabilities on outdated OS.
+  #
+  # Compensating control (by design):
+  #   - MongoDB port (27017) restricted to K8s Worker SG only
+  #     despite the instance being in a public subnet
+  # ---------------------------------------------------------------------------
+  MongoDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-mongodb-sg"
+      GroupDescription: "MongoDB EC2 SG - INTENTIONAL WEAKNESS: SSH (22) open to 0.0.0.0/0. MongoDB port restricted to K8s Worker SG only. S3 backup egress via VPC Gateway Endpoint."
+      VpcId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-VPCId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: "INTENTIONAL WEAKNESS: SSH open to public internet - Wiz exercise requirement"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "HTTPS outbound - S3 backup via VPC endpoint, SSM agent, CloudWatch agent"
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: "DNS outbound - hostname resolution for backup scripts and AWS API endpoints"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mongodb-sg"
+        - Key: Purpose
+          Value: "MongoDB-EC2"
+        - Key: SecurityWeakness
+          Value: "SSH-Open-To-Internet"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  MongoDBPortFromWorkerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MongoDBSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref MongoDBPort
+      ToPort: !Ref MongoDBPort
+      SourceSecurityGroupId: !Ref K8sWorkerSecurityGroup
+      Description: "MongoDB port - K8s worker nodes only (Tasky app to MongoDB connection)"
+
+  # ===========================================================================
+  # SECTION 2.2: IAM ROLES & POLICIES
+  # ===========================================================================
+  # IAM roles follow least-privilege EXCEPT where intentional weaknesses
+  # are required by the exercise (MongoDB EC2 role).
+  #
+  # All EC2 roles include AmazonSSMManagedInstanceCore managed policy to
+  # enable SSM Session Manager as a secure alternative to SSH for
+  # legitimate management access.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Section 2.2.1: AWS Load Balancer Controller IAM Policy
+  # ---------------------------------------------------------------------------
+  # Scoped policy for the AWS LB Controller running on K8s nodes.
+  # Attached to both Master and Worker node roles as the controller
+  # may run on either in a self-managed cluster.
+  # ---------------------------------------------------------------------------
+  AWSLoadBalancerControllerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${EnvironmentName}-aws-lb-controller-policy"
+      Description: "Scoped IAM policy for AWS Load Balancer Controller on K8s nodes. Grants minimum permissions to manage ALB/NLB from K8s Ingress annotations."
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # ------------------------------------------------------------------
+          # ELB Service-Linked Role Creation
+          # Required once per account for ALB to function
+          # ------------------------------------------------------------------
+          - Sid: CreateELBServiceLinkedRole
+            Effect: Allow
+            Action:
+              - iam:CreateServiceLinkedRole
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "iam:AWSServiceName": "elasticloadbalancing.amazonaws.com"
+
+          # ------------------------------------------------------------------
+          # Read-only permissions - Describe operations
+          # Required for LB Controller to discover VPC topology and
+          # existing LB resources before creating/modifying them
+          # ------------------------------------------------------------------
+          - Sid: DescribeNetworkResources
+            Effect: Allow
+            Action:
+              - ec2:DescribeAccountAttributes
+              - ec2:DescribeAddresses
+              - ec2:DescribeAvailabilityZones
+              - ec2:DescribeInternetGateways
+              - ec2:DescribeVpcs
+              - ec2:DescribeVpcPeeringConnections
+              - ec2:DescribeSubnets
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeInstances
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeTags
+              - ec2:GetCoipPoolUsage
+              - ec2:DescribeCoipPools
+            Resource: "*"
+
+          - Sid: DescribeELBResources
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:DescribeLoadBalancers
+              - elasticloadbalancing:DescribeLoadBalancerAttributes
+              - elasticloadbalancing:DescribeListeners
+              - elasticloadbalancing:DescribeListenerCertificates
+              - elasticloadbalancing:DescribeSSLPolicies
+              - elasticloadbalancing:DescribeRules
+              - elasticloadbalancing:DescribeTargetGroups
+              - elasticloadbalancing:DescribeTargetGroupAttributes
+              - elasticloadbalancing:DescribeTargetHealth
+              - elasticloadbalancing:DescribeTags
+              - elasticloadbalancing:DescribeListenerAttributes
+            Resource: "*"
+
+          # ------------------------------------------------------------------
+          # Certificate and WAF read permissions
+          # Required for ALB HTTPS listener configuration
+          # ------------------------------------------------------------------
+          - Sid: DescribeCertificatesAndWAF
+            Effect: Allow
+            Action:
+              - acm:ListCertificates
+              - acm:DescribeCertificate
+              - cognito-idp:DescribeUserPoolClient
+              - waf-regional:GetWebACL
+              - waf-regional:GetWebACLForResource
+              - waf-regional:AssociateWebACL
+              - waf-regional:DisassociateWebACL
+              - wafv2:GetWebACL
+              - wafv2:GetWebACLForResource
+              - wafv2:AssociateWebACL
+              - wafv2:DisassociateWebACL
+              - shield:GetSubscriptionState
+              - shield:DescribeProtection
+              - shield:CreateProtection
+              - shield:DeleteProtection
+            Resource: "*"
+
+          # ------------------------------------------------------------------
+          # Security Group management for ALB
+          # LB Controller creates and manages SGs for ALBs it provisions
+          # ------------------------------------------------------------------
+          - Sid: ManageALBSecurityGroups
+            Effect: Allow
+            Action:
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:CreateSecurityGroup
+            Resource: "*"
+
+          - Sid: TagALBSecurityGroups
+            Effect: Allow
+            Action:
+              - ec2:CreateTags
+              - ec2:DeleteTags
+            Resource: "arn:aws:ec2:*:*:security-group/*"
+            Condition:
+              StringEquals:
+                "ec2:CreateAction": "CreateSecurityGroup"
+
+          - Sid: ManageALBSecurityGroupTags
+            Effect: Allow
+            Action:
+              - ec2:CreateTags
+              - ec2:DeleteTags
+            Resource: "arn:aws:ec2:*:*:security-group/*"
+
+          - Sid: DeleteALBSecurityGroups
+            Effect: Allow
+            Action:
+              - ec2:DeleteSecurityGroup
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "ec2:ResourceTag/elbv2.k8s.aws/cluster": !Ref EnvironmentName
+
+          # ------------------------------------------------------------------
+          # ELB resource management
+          # Core permissions for creating/modifying/deleting ALB resources
+          # triggered by K8s Ingress resource creation/updates
+          # ------------------------------------------------------------------
+          - Sid: CreateELBResources
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:CreateLoadBalancer
+              - elasticloadbalancing:CreateTargetGroup
+            Resource: "*"
+
+          - Sid: CreateELBListenersAndRules
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:CreateListener
+              - elasticloadbalancing:DeleteListener
+              - elasticloadbalancing:CreateRule
+              - elasticloadbalancing:DeleteRule
+            Resource: "*"
+
+          - Sid: ManageELBTags
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:AddTags
+              - elasticloadbalancing:RemoveTags
+            Resource:
+              - "arn:aws:elasticloadbalancing:*:*:targetgroup/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:loadbalancer/net/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:loadbalancer/app/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:listener/net/*/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:listener/app/*/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:listener-rule/net/*/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:listener-rule/app/*/*/*"
+
+          - Sid: ModifyELBResources
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:ModifyLoadBalancerAttributes
+              - elasticloadbalancing:SetIpAddressType
+              - elasticloadbalancing:SetSecurityGroups
+              - elasticloadbalancing:SetSubnets
+              - elasticloadbalancing:DeleteLoadBalancer
+              - elasticloadbalancing:ModifyTargetGroup
+              - elasticloadbalancing:ModifyTargetGroupAttributes
+              - elasticloadbalancing:DeleteTargetGroup
+              - elasticloadbalancing:ModifyListenerAttributes
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "aws:ResourceTag/elbv2.k8s.aws/cluster": !Ref EnvironmentName
+
+          - Sid: ManageELBTargets
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:RegisterTargets
+              - elasticloadbalancing:DeregisterTargets
+            Resource: "arn:aws:elasticloadbalancing:*:*:targetgroup/*/*"
+
+          - Sid: ManageELBListenerCerts
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:SetWebAcl
+              - elasticloadbalancing:ModifyListener
+              - elasticloadbalancing:AddListenerCertificates
+              - elasticloadbalancing:RemoveListenerCertificates
+              - elasticloadbalancing:ModifyRule
+            Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # Section 2.2.2: MongoDB EC2 IAM Role
+  # ---------------------------------------------------------------------------
+  # INTENTIONAL SECURITY WEAKNESSES (required by Wiz exercise):
+  #   1. ec2:* - grants ability to create, modify, delete EC2 instances
+  #      This far exceeds what MongoDB needs (should only need S3 access)
+  #      Wiz finding: Critical - EC2 instance with overly permissive IAM role
+  #      Real-world risk: If MongoDB EC2 is compromised via SSH (also exposed),
+  #      attacker can use instance metadata credentials to launch new EC2
+  #      instances, pivot through the environment, or cause resource abuse.
+  # ---------------------------------------------------------------------------
+  MongoDBInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-mongodb-instance-role"
+      Description: "IAM Role for MongoDB EC2 instance with INTENTIONAL WEAKNESS as it includes ec2:* overpermission for the exercise."
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-mongodb-s3-backup"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: MongoDBBackupS3Access
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${EnvironmentName}-mongodb-backups"
+                  - !Sub "arn:aws:s3:::${EnvironmentName}-mongodb-backups/*"
+        - PolicyName: !Sub "${EnvironmentName}-mongodb-secrets-read"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadMongoSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${EnvironmentName}/mongodb/admin-credentials-*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${EnvironmentName}/tasky/mongodb-credentials-*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${EnvironmentName}/tasky/mongodb-uri-*"
+        - PolicyName: !Sub "${EnvironmentName}-mongodb-overpermissive-ec2"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: OverpermissiveEC2ForWizExercise
+                Effect: Allow
+                Action:
+                  - ec2:*
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mongodb-instance-role"
+        - Key: Purpose
+          Value: "MongoDB-EC2"
+        - Key: SecurityWeakness
+          Value: "Overpermissive-EC2-IAM"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  MongoDBInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-mongodb-instance-profile"
+      Roles:
+        - !Ref MongoDBInstanceRole
+
+  # ---------------------------------------------------------------------------
+  # Section 2.2.3: K8s Master Node IAM Role
+  # ---------------------------------------------------------------------------
+  # Grants the K8s master node permissions required for:
+  #   - Self-managed kubeadm cluster operation
+  #   - AWS Load Balancer Controller (LB Controller may run on master)
+  #   - EC2 instance discovery for worker node registration
+  #   - SSM Session Manager for secure management access
+  #   - CloudWatch agent for log/metric delivery
+  # ---------------------------------------------------------------------------
+  K8sMasterInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-k8s-master-role"
+      Description: "IAM Role for K8s Master EC2 instance."
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - !Ref AWSLoadBalancerControllerPolicy
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-k8s-master-ec2-describe"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EC2 describe permissions for kubeadm node discovery
+              # and AWS cloud provider integration
+              - Sid: K8sMasterEC2Describe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeVolumesModifications
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeAvailabilityZones
+                Resource: "*"
+              # Tag management for K8s AWS cloud provider
+              - Sid: K8sMasterEC2Tags
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "ec2:CreateAction":
+                      - RunInstances
+                      - CreateVolume
+                      - CreateSnapshot
+        - PolicyName: !Sub "${EnvironmentName}-k8s-master-ssm"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: K8sMasterSSMParameters
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                  - ssm:PutParameter       # required: stores join-command and admin-kubeconfig
+                  - ssm:DeleteParameter    # required: cleanup of temp parameters if needed
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvironmentName}/*"
+        - PolicyName: !Sub "${EnvironmentName}-k8s-master-route53"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Route 53 permissions for K8s DNS management
+              # Required if using ExternalDNS controller
+              - Sid: K8sMasterRoute53
+                Effect: Allow
+                Action:
+                  - route53:GetHostedZone
+                  - route53:ListHostedZones
+                  - route53:ListResourceRecordSets
+                  - route53:ChangeResourceRecordSets
+                  - route53:ListTagsForResource
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-k8s-master-role"
+        - Key: Purpose
+          Value: "K8s-Control-Plane"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  K8sMasterInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-k8s-master-instance-profile"
+      Roles:
+        - !Ref K8sMasterInstanceRole
+
+  # ---------------------------------------------------------------------------
+  # Section 2.2.4: K8s Worker Node IAM Role
+  # ---------------------------------------------------------------------------
+  # Grants the K8s worker node permissions required for:
+  #   - AWS Load Balancer Controller (registers NodePort targets with ALB)
+  #   - External Secrets Operator (reads from AWS Secrets Manager)
+  #   - SSM Session Manager for secure management access
+  #   - CloudWatch agent for log/metric delivery
+  # ---------------------------------------------------------------------------
+  K8sWorkerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-k8s-worker-role"
+      Description: "IAM Role for K8s Worker EC2 instance."
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - !Ref AWSLoadBalancerControllerPolicy
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-k8s-worker-secrets"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Secrets Manager permissions for External Secrets Operator
+              # ESO reads MongoDB URI and JWT secret to sync into K8s Secrets
+              - Sid: ESOSecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:ListSecretVersionIds
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${EnvironmentName}/tasky/*"
+              # SSM Parameter Store read for ESO configuration
+              - Sid: ESOSSMParameterRead
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvironmentName}/*"
+
+        - PolicyName: !Sub "${EnvironmentName}-k8s-worker-ec2-describe"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EC2 describe permissions for K8s AWS cloud provider
+              - Sid: K8sWorkerEC2Describe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeAvailabilityZones
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-k8s-worker-role"
+        - Key: Purpose
+          Value: "K8s-Worker-Node"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  K8sWorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-k8s-worker-instance-profile"
+      Roles:
+        - !Ref K8sWorkerInstanceRole
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+# All Security Group IDs and IAM Role/Profile ARNs exported for use by
+# Stack 3 (Compute) when launching EC2 instances.
+#
+# IAM Policy ARN exported so it can be referenced in documentation
+# and auditing without needing to query IAM directly.
+# =============================================================================
+Outputs:
+
+  # ---------------------------------------------------------------------------
+  # Security Group IDs
+  # ---------------------------------------------------------------------------
+  ALBSecurityGroupId:
+    Description: "ALB Security Group ID - attach to Application Load Balancer"
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-ALBSecurityGroupId"
+
+  K8sMasterSecurityGroupId:
+    Description: "K8s Master Node Security Group ID - attach to master EC2 instance"
+    Value: !Ref K8sMasterSecurityGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sMasterSecurityGroupId"
+
+  K8sWorkerSecurityGroupId:
+    Description: "K8s Worker Node Security Group ID - attach to worker EC2 instance"
+    Value: !Ref K8sWorkerSecurityGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sWorkerSecurityGroupId"
+
+  MongoDBSecurityGroupId:
+    Description: "MongoDB EC2 Security Group ID - attach to MongoDB EC2 instance"
+    Value: !Ref MongoDBSecurityGroup
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBSecurityGroupId"
+
+  # ---------------------------------------------------------------------------
+  # IAM Instance Profile ARNs (used in EC2 LaunchTemplate/Instance resources)
+  # ---------------------------------------------------------------------------
+  MongoDBInstanceProfileArn:
+    Description: "MongoDB EC2 Instance Profile ARN"
+    Value: !GetAtt MongoDBInstanceProfile.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBInstanceProfileArn"
+
+  MongoDBInstanceProfileName:
+    Description: "MongoDB EC2 Instance Profile Name"
+    Value: !Ref MongoDBInstanceProfile
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBInstanceProfileName"
+
+  K8sMasterInstanceProfileArn:
+    Description: "K8s Master Node Instance Profile ARN"
+    Value: !GetAtt K8sMasterInstanceProfile.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sMasterInstanceProfileArn"
+
+  K8sMasterInstanceProfileName:
+    Description: "K8s Master Node Instance Profile Name"
+    Value: !Ref K8sMasterInstanceProfile
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sMasterInstanceProfileName"
+
+  K8sWorkerInstanceProfileArn:
+    Description: "K8s Worker Node Instance Profile ARN"
+    Value: !GetAtt K8sWorkerInstanceProfile.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sWorkerInstanceProfileArn"
+
+  K8sWorkerInstanceProfileName:
+    Description: "K8s Worker Node Instance Profile Name"
+    Value: !Ref K8sWorkerInstanceProfile
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sWorkerInstanceProfileName"
+
+  # ---------------------------------------------------------------------------
+  # IAM Role ARNs (for reference in documentation and auditing)
+  # ---------------------------------------------------------------------------
+  MongoDBInstanceRoleArn:
+    Description: "MongoDB EC2 IAM Role ARN - includes intentional ec2:* overpermission"
+    Value: !GetAtt MongoDBInstanceRole.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-MongoDBInstanceRoleArn"
+
+  K8sMasterInstanceRoleArn:
+    Description: "K8s Master Node IAM Role ARN"
+    Value: !GetAtt K8sMasterInstanceRole.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sMasterInstanceRoleArn"
+
+  K8sWorkerInstanceRoleArn:
+    Description: "K8s Worker Node IAM Role ARN"
+    Value: !GetAtt K8sWorkerInstanceRole.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-K8sWorkerInstanceRoleArn"
+
+  # ---------------------------------------------------------------------------
+  # Shared Policy ARN
+  # ---------------------------------------------------------------------------
+  AWSLBControllerPolicyArn:
+    Description: "AWS Load Balancer Controller IAM Policy ARN - attached to both K8s node roles"
+    Value: !Ref AWSLoadBalancerControllerPolicy
+    Export:
+      Name: !Sub "${EnvironmentName}-AWSLBControllerPolicyArn"
