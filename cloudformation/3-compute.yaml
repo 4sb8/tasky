@@ -1347,7 +1347,7 @@ Resources:
 
           chmod +x /usr/local/bin/mongodb-backup.sh
 
-          echo "0 2 * * * root /usr/local/bin/mongodb-backup.sh >> /var/log/mongodb-backup.log 2>&1" \
+          echo "0 * * * * root /usr/local/bin/mongodb-backup.sh >> /var/log/mongodb-backup.log 2>&1" \
             > /etc/cron.d/mongodb-backup
 
           systemctl enable crond
