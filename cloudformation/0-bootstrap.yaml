@@ -473,22 +473,13 @@ Resources:
                     echo "cfn-lint found errors - blocking deployment"
                     exit 1
                   fi
+
                 - echo "=== Build - Running cfn_nag security scanning ==="
                 - |
-                  # Verify suppression file exists before running cfn-nag
-                  if [ ! -f cloudformation/cfn_nag_suppression.yml ]; then
-                    echo "ERROR: cloudformation/cfn_nag_suppression.yml not found"
-                    echo "This file must exist in the repository. Failing build."
-                    exit 1
-                  fi
-
                   # Run cfn-nag - always exit 0 so pipeline continues
-                  # All findings (suppressed and unsuppressed) are captured
-                  # in the JSON report for review
                   cfn_nag_scan \
                     --input-path cloudformation/ \
                     --template-pattern '(?!cfn_nag_suppression).*\.(yaml|yml)' \
-                    --deny-list-path cloudformation/cfn_nag_suppression.yml \
                     --output-format json \
                     > /tmp/cfn_nag_results.json 2>&1 || true
 
