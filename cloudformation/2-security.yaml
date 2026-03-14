@@ -369,6 +369,26 @@ Resources:
       SourceSecurityGroupId: !Ref K8sWorkerSecurityGroup
       Description: "Calico VXLAN encapsulation - worker to worker"
 
+  K8sMasterDNSTCPromWorkerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sMasterSecurityGroup
+      IpProtocol: tcp
+      FromPort: 53
+      ToPort: 53
+      SourceSecurityGroupId: !Ref K8sWorkerSecurityGroup
+      Description: "DNS TCP - pod network traffic from worker"
+
+  K8sMasterDNSUDPromWorkerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K8sMasterSecurityGroup
+      IpProtocol: udp
+      FromPort: 53
+      ToPort: 53
+      SourceSecurityGroupId: !Ref K8sWorkerSecurityGroup
+      Description: "DNS UDP - pod network traffic from worker"
+
   K8sMasterVXLANFromWorkerIngress:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
