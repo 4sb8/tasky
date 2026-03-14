@@ -16,25 +16,8 @@
 RulesToSuppress:
 
   # ---------------------------------------------------------------------------
-  # MongoDB EC2 - Intentional Weaknesses (Stack 2 & Stack 3)
+  # Resource Naming - Accepted Pattern
   # ---------------------------------------------------------------------------
-
-  - id: W2202
-    reason: >
-      INTENTIONAL WEAKNESS - MongoDB EC2 security group allows SSH (port 22)
-      from 0.0.0.0/0. Required by Wiz exercise to demonstrate internet-exposed
-      SSH as an attack vector for GuardDuty and Wiz to detect.
-
-  - id: W9901
-    reason: >
-      INTENTIONAL WEAKNESS - MongoDB EC2 security group allows unrestricted
-      ingress on port 22. Required by Wiz exercise.
-
-  - id: W2047
-    reason: >
-      INTENTIONAL WEAKNESS - MongoDB EC2 EBS volume is unencrypted.
-      Required by Wiz exercise to demonstrate unencrypted storage as a
-      detectable misconfiguration. K8s nodes use encrypted volumes.
 
   - id: W28
     reason: >
@@ -43,15 +26,15 @@ RulesToSuppress:
       Names are environment-prefixed to avoid collisions.
 
   # ---------------------------------------------------------------------------
-  # S3 Buckets - Intentional and Accepted Weaknesses
+  # S3 Buckets - Intentional and Accepted
   # ---------------------------------------------------------------------------
 
   - id: W35
     reason: >
-      INTENTIONAL WEAKNESS - MongoDB backup S3 bucket intentionally allows
-      public read and listing per Wiz exercise requirements. Other buckets
-      (pipeline artifacts, CloudTrail logs) do not have public access but
-      S3 access logging is not required for this demo environment.
+      INTENTIONAL WEAKNESS - MongoDB backup S3 bucket intentionally has no
+      access logging per Wiz exercise requirements. Other buckets (pipeline
+      artifacts, CloudTrail logs) also omit access logging as this is a
+      demo environment.
 
   - id: F14
     reason: >
@@ -61,9 +44,14 @@ RulesToSuppress:
 
   - id: F16
     reason: >
-      INTENTIONAL WEAKNESS - MongoDB backup S3 bucket intentionally has
-      public listing enabled. Required by Wiz exercise to demonstrate
-      enumerable backup data as a detectable misconfiguration.
+      INTENTIONAL WEAKNESS - MongoDB backup S3 bucket policy uses wildcard
+      principal to allow public listing. Required by Wiz exercise.
+
+  - id: W41
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB backup S3 bucket intentionally has no
+      encryption. Required by Wiz exercise to demonstrate unencrypted backup
+      storage as a detectable misconfiguration.
 
   - id: W51
     reason: >
@@ -72,16 +60,32 @@ RulesToSuppress:
       public access per exercise requirements.
 
   # ---------------------------------------------------------------------------
-  # IAM - Intentional and Accepted Weaknesses
+  # IAM - Intentional and Accepted
   # ---------------------------------------------------------------------------
+
+  - id: F3
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB EC2 IAM role includes ec2:* wildcard
+      action. Required by Wiz exercise to demonstrate overly permissive
+      CSP permissions as a detectable attack vector.
 
   - id: F4
     reason: >
       INTENTIONAL WEAKNESS - MongoDB EC2 IAM role is granted ec2:* permissions
-      on all resources. Required by Wiz exercise to demonstrate overly
-      permissive CSP permissions as a detectable attack vector.
-      CloudFormation execution role requires broad permissions to manage
-      all WizTT infrastructure resources across all stacks.
+      on all resources. Required by Wiz exercise. CloudFormation execution
+      role also requires broad permissions to manage all WizTT stacks.
+
+  - id: F38
+    reason: >
+      CloudFormation execution role requires iam:PassRole with broad resource
+      scope in order to pass roles to EC2 instances, CodeBuild, and other
+      services during stack deployments across all 5 stacks.
+
+  - id: W11
+    reason: >
+      Wildcard resources are used where resource-level permissions are not
+      supported by the AWS service (e.g. CloudWatch Logs, EC2 Describe,
+      CloudFormation validation). MongoDB role uses wildcard intentionally.
 
   - id: W12
     reason: >
@@ -89,12 +93,17 @@ RulesToSuppress:
       for ec2:* per exercise requirements. CloudFormation execution role
       also requires broad resource scope to deploy all stacks.
 
-  - id: F3
+  - id: W13
     reason: >
-      INTENTIONAL WEAKNESS - MongoDB EC2 IAM role includes ec2:* which
-      covers ec2:CreateVolume, ec2:RunInstances etc. Required by exercise.
-      CloudFormation execution role requires these permissions to manage
-      infrastructure.
+      AWS Load Balancer Controller IAM policy requires wildcard resources
+      for EC2 and ELB describe/tag actions as these do not support
+      resource-level permissions.
+
+  - id: W44
+    reason: >
+      CloudFormation execution role uses PowerUserAccess managed policy.
+      Required to give CloudFormation sufficient permissions to create all
+      WizTT resources across all stacks. Acceptable for this demo environment.
 
   - id: W76
     reason: >
@@ -102,74 +111,130 @@ RulesToSuppress:
       combined with inline IAM policies. Required to give CloudFormation
       sufficient permissions to create all WizTT resources across all stacks.
 
-  - id: W11
-    reason: >
-      Some IAM policies use wildcard resources where resource-level
-      permissions are not supported by the AWS service (e.g. CloudWatch
-      Logs, EC2 Describe actions, CloudFormation validation).
-
   # ---------------------------------------------------------------------------
-  # Security Groups - Accepted Patterns
+  # Security Groups - Intentional and Accepted
   # ---------------------------------------------------------------------------
 
-  - id: W29
+  - id: W2
     reason: >
-      Egress rules are explicitly defined on the ALB security group using
-      separate AWS::EC2::SecurityGroupEgress resources to avoid circular
-      dependency with the K8s worker security group. Other security groups
-      use default egress (allow all outbound) which is standard for
-      application servers requiring outbound internet access for package
-      installs and AWS API calls.
+      ALB security group intentionally allows inbound traffic from 0.0.0.0/0
+      on ports 80 and 443 - required for public internet access to the Tasky
+      application. MongoDB security group allows SSH from 0.0.0.0/0 which is
+      an INTENTIONAL WEAKNESS required by the Wiz exercise.
+
+  - id: W5
+    reason: >
+      K8s Master, Worker, and MongoDB security groups allow all outbound
+      traffic required for AWS API calls, package installs, and cluster
+      communication. NAT instance requires open egress by design.
+
+  - id: W9
+    reason: >
+      ALB security group uses /0 CIDR for public internet access (required).
+      MongoDB security group uses /0 for SSH which is an INTENTIONAL
+      WEAKNESS required by the Wiz exercise.
 
   - id: W27
     reason: >
-      INTENTIONAL WEAKNESS - MongoDB security group allows SSH from
-      0.0.0.0/0 on port 22. Required by Wiz exercise.
+      INTENTIONAL WEAKNESS - MongoDB security group allows SSH (port 22)
+      from 0.0.0.0/0. Required by Wiz exercise to demonstrate internet-
+      exposed SSH as an attack vector detectable by GuardDuty and Wiz.
+
+  - id: W29
+    reason: >
+      Egress rules on the ALB security group are defined via separate
+      AWS::EC2::SecurityGroupEgress resources to avoid circular dependency
+      with the K8s worker security group. Other SGs use default egress.
+
+  - id: W33
+    reason: >
+      Public subnets intentionally have MapPublicIpOnLaunch enabled.
+      The MongoDB EC2 instance and NAT instance require public IPs to be
+      reachable from the internet and to route traffic respectively.
 
   - id: W40
     reason: >
-      Some security groups allow all outbound traffic (0.0.0.0/0) which
-      is required for EC2 instances to reach AWS service endpoints,
-      download packages, and communicate with external services.
+      K8s Master and Worker security groups use protocol -1 for egress to
+      allow all outbound traffic required for cluster communication, AWS
+      API calls, and container image pulls.
+
+  - id: W42
+    reason: >
+      NAT instance security group uses protocol -1 for ingress to allow
+      it to forward all traffic from private subnet instances to the
+      internet. This is required for NAT functionality.
+
+  - id: F1000
+    reason: >
+      SSM VPC endpoint security group does not have an explicit egress rule.
+      The default allow-all egress is acceptable for VPC interface endpoints
+      which only need to respond to inbound requests from within the VPC.
 
   # ---------------------------------------------------------------------------
-  # CloudWatch / Logging - Accepted Patterns
+  # CloudWatch / Logging - Accepted
   # ---------------------------------------------------------------------------
 
   - id: W84
     reason: >
       CloudWatch Log Groups use default AWS-managed encryption rather than
       customer-managed KMS keys. Acceptable for this demo environment.
-      KMS key management adds operational overhead not required here.
+      KMS key management adds significant operational overhead not justified
+      for a demo exercise.
 
   - id: W86
     reason: >
-      Some CloudWatch Log Groups do not have explicit retention periods set
-      via cfn-nag's expectation. Retention is explicitly configured on all
-      log groups in this environment.
+      Retention is explicitly configured on all log groups in this
+      environment. cfn-nag W86 is suppressed as retention is set.
+
+  - id: W47
+    reason: >
+      SNS alarm notification topic does not use a KMS key. Acceptable for
+      this demo environment where the topic delivers CloudWatch alarm
+      notifications only.
 
   # ---------------------------------------------------------------------------
-  # CodeBuild - Accepted Patterns
+  # CodeBuild - Accepted
   # ---------------------------------------------------------------------------
 
   - id: W32
     reason: >
-      CodeBuild projects use CodePipeline as the artifact type and do not
-      require a separate encryption key beyond the default S3 SSE-AES256
-      used on the pipeline artifact bucket.
-
-  # ---------------------------------------------------------------------------
-  # General
-  # ---------------------------------------------------------------------------
+      CodeBuild projects use the default S3 SSE-AES256 encryption via the
+      pipeline artifact bucket. A separate customer-managed KMS key is not
+      required for this demo environment.
 
   - id: W89
     reason: >
-      CodeBuild projects for IaC scanning do not require VPC placement.
-      Only the K8s deploy CodeBuild project (Stack 5) uses VPC config
-      to reach the private K8s API server.
+      IaC scanning CodeBuild project does not require VPC placement as it
+      only runs cfn-lint and cfn-nag against templates. Only the K8s deploy
+      CodeBuild project (Stack 5) uses VPC config to reach the K8s API server.
 
   - id: W92
     reason: >
-      CodeBuild projects do not define concurrency limits. For this demo
-      environment sequential pipeline execution is expected and concurrency
-      limits are not required.
+      CodeBuild projects do not define concurrency limits. Sequential pipeline
+      execution is expected for this demo environment.
+
+  # ---------------------------------------------------------------------------
+  # Load Balancer - Accepted
+  # ---------------------------------------------------------------------------
+
+  - id: W52
+    reason: >
+      ALB access logging is intentionally disabled to avoid S3 write costs
+      in this demo environment. Access logging can be enabled for production
+      by setting access_logs.s3.enabled to true in the ALB attributes.
+
+  - id: W56
+    reason: >
+      ALB HTTP listener (port 80) intentionally uses HTTP protocol because
+      its sole purpose is to issue a 301 redirect to HTTPS. All actual
+      application traffic is served over HTTPS on port 443.
+
+  # ---------------------------------------------------------------------------
+  # Secrets Manager - Accepted
+  # ---------------------------------------------------------------------------
+
+  - id: W77
+    reason: >
+      Secrets Manager secrets use the default AWS-managed KMS key rather
+      than a customer-managed key. Acceptable for this demo environment.
+      Cross-account secret sharing is not required.

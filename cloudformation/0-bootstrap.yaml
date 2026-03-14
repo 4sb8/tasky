@@ -447,7 +447,7 @@ Resources:
               commands:
                 - echo "=== Pre-build - Discovering CloudFormation templates ==="
                 - |
-                  CF_TEMPLATES=$(find cloudformation/ -name "*.yaml" -o -name "*.yml" | grep -v cfn_nag_suppression | sort)
+                  CF_TEMPLATES=$(find cloudformation/ -name "*.yaml" -o -name "*.yml" | sort)
                   echo "Templates found:"
                   echo "$CF_TEMPLATES"
                   echo "$CF_TEMPLATES" > /tmp/cf_templates.txt
@@ -487,7 +487,7 @@ Resources:
                   # in the JSON report for review
                   cfn_nag_scan \
                     --input-path cloudformation/ \
-                    --template-pattern '.*\.(yaml|yml)' \
+                    --template-pattern '(?!cfn_nag_suppression).*\.(yaml|yml)' \
                     --deny-list-path cloudformation/cfn_nag_suppression.yml \
                     --output-format json \
                     > /tmp/cfn_nag_results.json 2>&1 || true
