@@ -47,7 +47,7 @@ metadata:
     app.kubernetes.io/name: tasky
     app.kubernetes.io/version: latest
     app.kubernetes.io/part-of: wiztt
-    environment: wiztt
+    environment: demo
     managed-by: kubectl
   annotations:
     description: "Tasky todo application deployment"
@@ -74,7 +74,7 @@ spec:
         app: tasky
         app.kubernetes.io/name: tasky
         app.kubernetes.io/part-of: wiztt
-        environment: wiztt
+        environment: demo
       annotations:
         description: "Tasky application pod"
         # Force pod restart when secret changes by including secret

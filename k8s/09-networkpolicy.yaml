@@ -36,7 +36,7 @@ metadata:
     app: tasky
     app.kubernetes.io/name: tasky
     app.kubernetes.io/part-of: wiztt
-    environment: wiztt
+    environment: demo
     managed-by: kubectl
   annotations:
     description: >
