@@ -1217,7 +1217,7 @@ Resources:
           mongo admin /tmp/create-users.js
           echo "Admin user created successfully"
 
-          mongo "${MongoDBDatabaseName}" /tmp/create-app-user.js
+          mongo admin /tmp/create-app-user.js
           echo "App user and collections created successfully"
 
           rm -f /tmp/create-users.js /tmp/create-app-user.js
