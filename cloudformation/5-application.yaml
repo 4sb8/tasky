@@ -906,31 +906,12 @@ Resources:
                     exit 1
                   fi
 
-                  # Inject ARNs into ingress manifest annotations
-                  # Using a Python script to safely insert into YAML annotations
-                  python3 << PYEOF
-                  import re
+                  # Inject ARNs into ingress manifest via sed substitution
+                  sed -i "s|REPLACE_WITH_ALB_ARN|${ALB_ARN}|g" k8s/08-ingress.yaml
+                  sed -i "s|REPLACE_WITH_CERT_ARN|${CERT_ARN}|g" k8s/08-ingress.yaml
+                  sed -i "s|REPLACE_WITH_WAF_ARN|${WAF_ARN}|g" k8s/08-ingress.yaml
 
-                  with open('k8s/08-ingress.yaml', 'r') as f:
-                    content = f.read()
-
-                  # Insert ARN annotations after the target-type annotation
-                  insert_after = 'alb.ingress.kubernetes.io/target-type: instance'
-                  arn_annotations = """
-                      alb.ingress.kubernetes.io/load-balancer-arn: "${ALB_ARN}"
-                      alb.ingress.kubernetes.io/certificate-arn: "${CERT_ARN}"
-                      alb.ingress.kubernetes.io/wafv2-acl-arn: "${WAF_ARN}" """
-
-                  content = content.replace(
-                    insert_after,
-                    insert_after + arn_annotations
-                  )
-
-                  with open('k8s/08-ingress.yaml', 'w') as f:
-                    f.write(content)
-
-                  print("ARNs injected into k8s/08-ingress.yaml successfully")
-                  PYEOF
+                  echo "ARNs injected into k8s/08-ingress.yaml successfully"
 
             build:
               commands:

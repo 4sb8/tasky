@@ -56,13 +56,24 @@ metadata:
     # internet-facing: ALB is publicly accessible
     alb.ingress.kubernetes.io/scheme: internet-facing
 
-    # IP target type: routes directly to pod IP (requires VPC CNI)
     # instance target type: routes to node IP + NodePort
     # Using 'instance' for self-managed K8s (no VPC CNI / no EKS)
     alb.ingress.kubernetes.io/target-type: instance
 
-    # ALB ARN, certificate ARN and WAF ARN are injected at deploy time
-    # by the K8s deploy CodeBuild stage from CloudFormation stack outputs
+    # ALB ARN injected at deploy time by K8s deploy CodeBuild stage
+    # from CloudFormation stack outputs. This tells the LB controller
+    # to attach to the existing CF-managed ALB instead of creating a new one.
+    # The load-balancer-arn annotation requires the group.name annotation
+    # to work correctly - both must be present.
+    alb.ingress.kubernetes.io/load-balancer-arn: "REPLACE_WITH_ALB_ARN"
+
+    # IngressGroup causes the LB controller to attach to the existing ALB
+    # rather than creating a new one. Required when using load-balancer-arn.
+    alb.ingress.kubernetes.io/group.name: "wiztt"
+    alb.ingress.kubernetes.io/group.order: "10"
+
+    # Certificate ARN injected at deploy time
+    alb.ingress.kubernetes.io/certificate-arn: "REPLACE_WITH_CERT_ARN"
 
     # HTTPS listener on port 443
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
@@ -72,6 +83,9 @@ metadata:
 
     # Redirect HTTP to HTTPS at ALB level
     alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # WAF ARN injected at deploy time
+    alb.ingress.kubernetes.io/wafv2-acl-arn: "REPLACE_WITH_WAF_ARN"
 
     # Health check configuration matching ALB Target Group (Stack 5)
     alb.ingress.kubernetes.io/healthcheck-path: /
