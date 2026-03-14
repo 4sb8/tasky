@@ -486,25 +486,33 @@ Resources:
                   echo "=== cfn_nag Raw Results ==="
                   cat /tmp/cfn_nag_results.json
 
-                  # Count unsuppressed violations (type=FAIL, not WARN)
+                  # Count FAIL violations across all templates
                   VIOLATION_COUNT=$(python3 -c "
                   import json, sys
                   try:
                     with open('/tmp/cfn_nag_results.json') as f:
                       d = json.load(f)
-                    count = sum(len(r.get('violations',[])) for r in d if r.get('type')=='FAIL')
+                    count = sum(
+                      1 for r in d
+                      for v in r.get('file_results', {}).get('violations', [])
+                      if v.get('type') == 'FAIL'
+                    )
                     print(count)
                   except Exception as e:
                     print('0')
                   " 2>/dev/null || echo "0")
 
-                  # Count warnings (suppressed intentional weaknesses)
+                  # Count WARN violations across all templates
                   WARNING_COUNT=$(python3 -c "
                   import json, sys
                   try:
                     with open('/tmp/cfn_nag_results.json') as f:
                       d = json.load(f)
-                    count = sum(len(r.get('violations',[])) for r in d if r.get('type')=='WARN')
+                    count = sum(
+                      1 for r in d
+                      for v in r.get('file_results', {}).get('violations', [])
+                      if v.get('type') == 'WARN'
+                    )
                     print(count)
                   except Exception as e:
                     print('0')
