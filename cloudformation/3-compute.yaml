@@ -704,7 +704,7 @@ Resources:
             - name: default-ipv4-ippool
               blockSize: 26
               cidr: POD_CIDR_PLACEHOLDER
-              encapsulation: VXLANCrossSubnet
+              encapsulation: VXLAN
               natOutgoing: Enabled
               nodeSelector: all()
         ---
