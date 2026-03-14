@@ -447,7 +447,7 @@ Resources:
               commands:
                 - echo "=== Pre-build - Discovering CloudFormation templates ==="
                 - |
-                  CF_TEMPLATES=$(find cloudformation/ -name "*.yaml" -o -name "*.yml" | sort)
+                  CF_TEMPLATES=$(find cloudformation/ -name "*.yaml" -o -name "*.yml" | grep -v cfn_nag_suppression | sort)
                   echo "Templates found:"
                   echo "$CF_TEMPLATES"
                   echo "$CF_TEMPLATES" > /tmp/cf_templates.txt
