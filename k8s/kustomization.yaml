@@ -52,10 +52,10 @@ resources:
   - 02-serviceaccount.yaml
   - 03-clusterrolebinding.yaml
   - 04-clustersecretstore.yaml
-  - 05-externalsecret.yaml
   - 09-networkpolicy.yaml
   - 06-deployment.yaml
   - 07-service.yaml
   - 08-ingress.yaml
-  # 10-verification-job.yaml is applied separately by CI/CD pipeline
-  # after deployment verification, then deleted via ttlSecondsAfterFinished
+  # 05-externalsecret.yaml applied separately by CI/CD pipeline (kubectl apply -f)
+  # to avoid kustomize injecting spec.target.namespace unsupported in ESO v1
+  # 10-verification-job.yaml applied separately after deployment verification

@@ -936,8 +936,18 @@ Resources:
               commands:
                 - echo "=== Build - Applying K8s manifests ==="
                 - |
+                  # Delete deployment first if selector labels have changed
+                  # (spec.selector is immutable - must delete and recreate)
+                  kubectl delete deployment tasky -n tasky --ignore-not-found=true
+
                   kubectl apply -k k8s/ --record 2>/dev/null || \
                   kubectl apply -k k8s/
+
+                - echo "=== Build - Applying ExternalSecret (separate from kustomize) ==="
+                - |
+                  # Applied separately to avoid kustomize injecting spec.target.namespace
+                  # which is not supported in ESO v1
+                  kubectl apply -f k8s/05-externalsecret.yaml
 
                 - echo "=== Build - Updating Tasky deployment image ==="
                 - |
