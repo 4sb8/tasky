@@ -62,7 +62,7 @@ spec:
 
   egress:
     # Allow MongoDB access on port 27017
-    # MongoDB EC2 is in Public Subnet 3 (10.0.3.0/24)
+    # MongoDB EC2 is in Public Subnet 2 (10.0.2.0/24)
     # Further restricted at network layer by MongoDB Security Group
     # which only allows port 27017 from K8s Worker SG
     - ports:
@@ -70,7 +70,7 @@ spec:
           port: 27017
       to:
         - ipBlock:
-            cidr: 10.0.3.0/24
+            cidr: 10.0.2.0/24
 
     # Allow HTTPS to AWS APIs
     # Required for: AWS Secrets Manager (ESO), ECR image pulls
