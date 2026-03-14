@@ -1,0 +1,175 @@
+# =============================================================================
+# cfn_nag Suppression File - WizTT Exercise
+# =============================================================================
+# This file acknowledges known INTENTIONAL security weaknesses in the WizTT
+# environment. These suppressions prevent cfn-nag from failing the pipeline
+# on expected findings while still surfacing unexpected violations.
+#
+# Format:
+#   RulesToSuppress:
+#     - id: <RULE_ID>
+#       reason: <explanation>
+#
+# Suppression scope: file-level (applies to all templates scanned)
+# =============================================================================
+
+RulesToSuppress:
+
+  # ---------------------------------------------------------------------------
+  # MongoDB EC2 - Intentional Weaknesses (Stack 2 & Stack 3)
+  # ---------------------------------------------------------------------------
+
+  - id: W2202
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB EC2 security group allows SSH (port 22)
+      from 0.0.0.0/0. Required by Wiz exercise to demonstrate internet-exposed
+      SSH as an attack vector for GuardDuty and Wiz to detect.
+
+  - id: W9901
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB EC2 security group allows unrestricted
+      ingress on port 22. Required by Wiz exercise.
+
+  - id: W2047
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB EC2 EBS volume is unencrypted.
+      Required by Wiz exercise to demonstrate unencrypted storage as a
+      detectable misconfiguration. K8s nodes use encrypted volumes.
+
+  - id: W28
+    reason: >
+      Explicit resource naming is used throughout for cross-stack references,
+      pipeline parameter overrides, and consistent resource identification.
+      Names are environment-prefixed to avoid collisions.
+
+  # ---------------------------------------------------------------------------
+  # S3 Buckets - Intentional and Accepted Weaknesses
+  # ---------------------------------------------------------------------------
+
+  - id: W35
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB backup S3 bucket intentionally allows
+      public read and listing per Wiz exercise requirements. Other buckets
+      (pipeline artifacts, CloudTrail logs) do not have public access but
+      S3 access logging is not required for this demo environment.
+
+  - id: F14
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB backup S3 bucket intentionally has
+      public read access enabled. Required by Wiz exercise to demonstrate
+      publicly accessible backup data as a detectable misconfiguration.
+
+  - id: F16
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB backup S3 bucket intentionally has
+      public listing enabled. Required by Wiz exercise to demonstrate
+      enumerable backup data as a detectable misconfiguration.
+
+  - id: W51
+    reason: >
+      S3 bucket policies are defined separately as AWS::S3::BucketPolicy
+      resources. The MongoDB backup bucket policy intentionally allows
+      public access per exercise requirements.
+
+  # ---------------------------------------------------------------------------
+  # IAM - Intentional and Accepted Weaknesses
+  # ---------------------------------------------------------------------------
+
+  - id: F4
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB EC2 IAM role is granted ec2:* permissions
+      on all resources. Required by Wiz exercise to demonstrate overly
+      permissive CSP permissions as a detectable attack vector.
+      CloudFormation execution role requires broad permissions to manage
+      all WizTT infrastructure resources across all stacks.
+
+  - id: W12
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB EC2 IAM role uses wildcard resource
+      for ec2:* per exercise requirements. CloudFormation execution role
+      also requires broad resource scope to deploy all stacks.
+
+  - id: F3
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB EC2 IAM role includes ec2:* which
+      covers ec2:CreateVolume, ec2:RunInstances etc. Required by exercise.
+      CloudFormation execution role requires these permissions to manage
+      infrastructure.
+
+  - id: W76
+    reason: >
+      CloudFormation execution role uses AWS managed policy PowerUserAccess
+      combined with inline IAM policies. Required to give CloudFormation
+      sufficient permissions to create all WizTT resources across all stacks.
+
+  - id: W11
+    reason: >
+      Some IAM policies use wildcard resources where resource-level
+      permissions are not supported by the AWS service (e.g. CloudWatch
+      Logs, EC2 Describe actions, CloudFormation validation).
+
+  # ---------------------------------------------------------------------------
+  # Security Groups - Accepted Patterns
+  # ---------------------------------------------------------------------------
+
+  - id: W29
+    reason: >
+      Egress rules are explicitly defined on the ALB security group using
+      separate AWS::EC2::SecurityGroupEgress resources to avoid circular
+      dependency with the K8s worker security group. Other security groups
+      use default egress (allow all outbound) which is standard for
+      application servers requiring outbound internet access for package
+      installs and AWS API calls.
+
+  - id: W27
+    reason: >
+      INTENTIONAL WEAKNESS - MongoDB security group allows SSH from
+      0.0.0.0/0 on port 22. Required by Wiz exercise.
+
+  - id: W40
+    reason: >
+      Some security groups allow all outbound traffic (0.0.0.0/0) which
+      is required for EC2 instances to reach AWS service endpoints,
+      download packages, and communicate with external services.
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch / Logging - Accepted Patterns
+  # ---------------------------------------------------------------------------
+
+  - id: W84
+    reason: >
+      CloudWatch Log Groups use default AWS-managed encryption rather than
+      customer-managed KMS keys. Acceptable for this demo environment.
+      KMS key management adds operational overhead not required here.
+
+  - id: W86
+    reason: >
+      Some CloudWatch Log Groups do not have explicit retention periods set
+      via cfn-nag's expectation. Retention is explicitly configured on all
+      log groups in this environment.
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild - Accepted Patterns
+  # ---------------------------------------------------------------------------
+
+  - id: W32
+    reason: >
+      CodeBuild projects use CodePipeline as the artifact type and do not
+      require a separate encryption key beyond the default S3 SSE-AES256
+      used on the pipeline artifact bucket.
+
+  # ---------------------------------------------------------------------------
+  # General
+  # ---------------------------------------------------------------------------
+
+  - id: W89
+    reason: >
+      CodeBuild projects for IaC scanning do not require VPC placement.
+      Only the K8s deploy CodeBuild project (Stack 5) uses VPC config
+      to reach the private K8s API server.
+
+  - id: W92
+    reason: >
+      CodeBuild projects do not define concurrency limits. For this demo
+      environment sequential pipeline execution is expected and concurrency
+      limits are not required.
