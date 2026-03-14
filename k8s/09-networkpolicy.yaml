@@ -1,0 +1,89 @@
+# =============================================================================
+# WizTT - K8s Manifest 09: Network Policy
+# =============================================================================
+# File:            k8s/09-networkpolicy.yaml
+# Description:
+#   Defines Calico NetworkPolicy for the Tasky application namespace.
+#
+#   NOTE ON INTENTIONAL WEAKNESS vs SECURITY CONTROL:
+#   The exercise requires demonstrating security weaknesses. However,
+#   the NetworkPolicy is included here as a DETECTIVE element for the
+#   Wiz demo — showing what SHOULD be in place while other weaknesses
+#   (cluster-admin, root container, etc.) are still present.
+#
+#   Calico NetworkPolicy allows:
+#     Ingress to tasky pods:
+#       - Port 8080 from within the cluster (ALB NodePort path)
+#     Egress from tasky pods:
+#       - Port 27017 to MongoDB subnet (10.0.3.0/24)
+#       - Port 443 to AWS APIs (Secrets Manager, ECR)
+#       - Port 53 UDP/TCP for DNS resolution
+#
+#   This NetworkPolicy does NOT prevent the cluster-admin ServiceAccount
+#   token abuse — RBAC and NetworkPolicy are independent controls.
+#   A compromised pod with cluster-admin could still make K8s API calls
+#   regardless of NetworkPolicy (K8s API server is on the same network).
+#
+# Deployed By:     App CI/CD Pipeline (CodeBuild K8s deploy stage)
+# Depends On:      01-namespace.yaml, Calico CNI installed (Stack 3)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tasky-network-policy
+  namespace: tasky
+  labels:
+    app: tasky
+    app.kubernetes.io/name: tasky
+    app.kubernetes.io/part-of: wiztt
+    environment: wiztt
+    managed-by: kubectl
+  annotations:
+    description: >
+      NetworkPolicy restricting Tasky pod ingress/egress.
+      Ingress: port 8080 from cluster only.
+      Egress: MongoDB (27017), AWS APIs (443), DNS (53).
+spec:
+  # Apply this policy to tasky application pods
+  podSelector:
+    matchLabels:
+      app: tasky
+
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Allow inbound traffic on port 8080 from within the cluster
+    # This covers: ALB → NodePort → pod, and intra-cluster pod communication
+    - ports:
+        - protocol: TCP
+          port: 8080
+
+  egress:
+    # Allow MongoDB access on port 27017
+    # MongoDB EC2 is in Public Subnet 3 (10.0.3.0/24)
+    # Further restricted at network layer by MongoDB Security Group
+    # which only allows port 27017 from K8s Worker SG
+    - ports:
+        - protocol: TCP
+          port: 27017
+      to:
+        - ipBlock:
+            cidr: 10.0.3.0/24
+
+    # Allow HTTPS to AWS APIs
+    # Required for: AWS Secrets Manager (ESO), ECR image pulls
+    # Traffic routes via NAT instance for internet-bound requests
+    - ports:
+        - protocol: TCP
+          port: 443
+
+    # Allow DNS resolution (UDP and TCP)
+    # Required for: mongodb.internal.wizdemo.ca resolution
+    # CoreDNS runs in kube-system namespace on the master node
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

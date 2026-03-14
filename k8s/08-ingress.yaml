@@ -1,0 +1,111 @@
+# =============================================================================
+# WizTT - K8s Manifest 08: Ingress
+# =============================================================================
+# File:            k8s/08-ingress.yaml
+# Description:
+#   Defines the K8s Ingress resource for the Tasky application.
+#   Uses AWS Load Balancer Controller annotations to reference the
+#   pre-existing ALB created by Stack 5 CloudFormation.
+#
+#   Two approaches exist for ALB + K8s Ingress:
+#     A) Let AWS LB Controller CREATE a new ALB (via ingress annotations)
+#     B) Reference a pre-existing ALB (created by CloudFormation)
+#
+#   This manifest uses Approach B (reference pre-existing ALB) because:
+#     - The ALB is managed as IaC in Stack 5 (better lifecycle management)
+#     - WAF association is handled by CloudFormation (Stack 5)
+#     - ACM certificate is managed by CloudFormation (Stack 4)
+#     - Route 53 ALIAS is managed by CloudFormation (Stack 5)
+#
+#   The AWS LB Controller still manages TARGET GROUP registration,
+#   routing rules, and listener rules via this Ingress resource.
+#
+#   Prerequisites:
+#     AWS Load Balancer Controller installed via Helm:
+#       helm repo add eks https://aws.github.io/eks-charts
+#       helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#         --namespace kube-system \
+#         --set clusterName=demo \
+#         --set serviceAccount.create=false \
+#         --set serviceAccount.name=aws-load-balancer-controller
+#
+# Deployed By:     App CI/CD Pipeline (CodeBuild K8s deploy stage)
+# Depends On:      07-service.yaml, ALB exists (Stack 5)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tasky-ingress
+  namespace: tasky
+  labels:
+    app: tasky
+    app.kubernetes.io/name: tasky
+    app.kubernetes.io/part-of: wiztt
+    environment: demo
+    managed-by: kubectl
+  annotations:
+    description: "K8s Ingress for Tasky application via AWS ALB"
+
+    # -------------------------------------------------------------------------
+    # AWS Load Balancer Controller Annotations
+    # -------------------------------------------------------------------------
+
+    # Use the AWS ALB (Application Load Balancer)
+    kubernetes.io/ingress.class: alb
+
+    # internet-facing: ALB is publicly accessible
+    alb.ingress.kubernetes.io/scheme: internet-facing
+
+    # IP target type: routes directly to pod IP (requires VPC CNI)
+    # instance target type: routes to node IP + NodePort
+    # Using 'instance' for self-managed K8s (no VPC CNI / no EKS)
+    alb.ingress.kubernetes.io/target-type: instance
+
+    # ALB ARN, certificate ARN and WAF ARN are injected at deploy time
+    # by the K8s deploy CodeBuild stage from CloudFormation stack outputs
+
+    # HTTPS listener on port 443
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+
+    # Modern TLS policy matching Stack 5 ALB listener configuration
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+    # Redirect HTTP to HTTPS at ALB level
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # Health check configuration matching ALB Target Group (Stack 5)
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-port: "30080"
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    alb.ingress.kubernetes.io/success-codes: "200-399"
+
+    # Tags applied to ALB resources created/managed by LB Controller
+    alb.ingress.kubernetes.io/tags: >-
+      Environment=demo,
+      Project=WizTT,
+      ManagedBy=kubectl
+
+spec:
+  # Default backend for unmatched requests
+  # Routes all traffic to tasky-service (single application)
+  defaultBackend:
+    service:
+      name: tasky-service
+      port:
+        number: 80
+
+  rules:
+    # Route tasky.wizdemo.ca traffic to Tasky service
+    - host: tasky.wizdemo.ca
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tasky-service
+                port:
+                  number: 80

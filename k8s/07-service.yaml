@@ -1,0 +1,54 @@
+# =============================================================================
+# WizTT - K8s Manifest 07: Service
+# =============================================================================
+# File:            k8s/07-service.yaml
+# Description:
+#   Exposes the Tasky application pod via a NodePort Service.
+#   The ALB Target Group (Stack 5) forwards traffic to this NodePort
+#   on the K8s worker node EC2 instance.
+#
+#   Traffic flow:
+#     ALB (443) → WAF → Target Group → Worker Node:30080 → Pod:8080
+#
+#   NodePort 30080 must match:
+#     - Stack 2: NodePort parameter (SecurityGroup ingress rule)
+#     - Stack 5: NodePort parameter (ALB Target Group port)
+#     - This manifest: nodePort value below
+#
+# Deployed By:     App CI/CD Pipeline (CodeBuild K8s deploy stage)
+# Depends On:      06-deployment.yaml
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: tasky-service
+  namespace: tasky
+  labels:
+    app: tasky
+    app.kubernetes.io/name: tasky
+    app.kubernetes.io/part-of: wiztt
+    environment: wiztt
+    managed-by: kubectl
+  annotations:
+    description: >
+      NodePort Service exposing Tasky on port 30080.
+      ALB Target Group (Stack 5) registers worker node on this port.
+spec:
+  type: NodePort
+  selector:
+    # Routes traffic to pods with label app=tasky
+    # Must match Deployment pod template labels
+    app: tasky
+  ports:
+    - name: http
+      protocol: TCP
+      # Port: the Service's cluster-internal port
+      port: 80
+      # TargetPort: the container port (matches containerPort in Deployment)
+      # Named reference to the 'http' port defined in the Deployment
+      targetPort: http
+      # NodePort: the port exposed on every node's IP
+      # ALB Target Group forwards to this port on worker node EC2 instance
+      # Must be in K8s NodePort range 30000-32767
+      # Must match Stack 2 and Stack 5 NodePort parameters (30080)
+      nodePort: 30080

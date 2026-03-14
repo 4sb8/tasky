@@ -1,0 +1,246 @@
+# =============================================================================
+# WizTT - K8s Manifest 06: Deployment
+# =============================================================================
+# File:            k8s/06-deployment.yaml
+# Description:
+#   Deploys the Tasky application as a single-replica K8s Deployment.
+#
+#   Key configurations:
+#     - Single pod replica (demo environment)
+#     - Uses tasky-sa ServiceAccount (cluster-admin bound - intentional weakness)
+#     - Injects MONGODB_URI and SECRET_KEY from tasky-secrets K8s Secret
+#     - Image pulled from ECR (tag updated by app CI/CD pipeline)
+#     - wizexercise.txt verified to exist at /wizexercise.txt
+#     - Resource limits set to fit within t3.small worker node
+#     - Liveness and readiness probes on Tasky HTTP endpoint
+#
+# Intentional Security Weaknesses:
+#   1. cluster-admin ServiceAccount (via ClusterRoleBinding in 03-)
+#   2. No securityContext - container runs as root (default)
+#   3. No readOnlyRootFilesystem - container can write anywhere
+#   4. No network policy - pod can communicate with any endpoint
+#   5. hostNetwork: false (correct) but no AppArmor/Seccomp profiles
+#
+# Wiz Findings Expected:
+#   - Container running as root
+#   - No read-only root filesystem
+#   - Missing Seccomp profile
+#   - Missing AppArmor profile
+#   - Cluster-admin ServiceAccount (from ClusterRoleBinding)
+#
+# Image Tag:
+#   The image tag is set to 'latest' as placeholder here.
+#   The app CI/CD pipeline updates it to the specific commit SHA
+#   via: kubectl set image deployment/tasky tasky=<ECR_URI>:<SHA>
+#
+# Deployed By:     App CI/CD Pipeline (CodeBuild K8s deploy stage)
+# Depends On:      01-namespace, 02-serviceaccount, 03-clusterrolebinding,
+#                  05-externalsecret (tasky-secrets must exist before pod starts)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tasky
+  namespace: tasky
+  labels:
+    app: tasky
+    app.kubernetes.io/name: tasky
+    app.kubernetes.io/version: latest
+    app.kubernetes.io/part-of: wiztt
+    environment: wiztt
+    managed-by: kubectl
+  annotations:
+    description: "Tasky todo application deployment"
+spec:
+  # Single replica for demo environment
+  # Production: increase replicas and add PodDisruptionBudget
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: tasky
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # With single replica, this briefly causes downtime during update
+      # Production: set maxUnavailable: 0, maxSurge: 1 with replicas > 1
+      maxUnavailable: 1
+      maxSurge: 0
+
+  template:
+    metadata:
+      labels:
+        app: tasky
+        app.kubernetes.io/name: tasky
+        app.kubernetes.io/part-of: wiztt
+        environment: wiztt
+      annotations:
+        description: "Tasky application pod"
+        # Force pod restart when secret changes by including secret
+        # resource version in annotation (updated by CI/CD pipeline)
+        secret-hash: "placeholder-updated-by-pipeline"
+
+    spec:
+      # -----------------------------------------------------------------------
+      # ServiceAccount - INTENTIONAL WEAKNESS
+      # tasky-sa is bound to cluster-admin ClusterRole (03-clusterrolebinding)
+      # Pod inherits cluster-wide K8s admin privileges via mounted SA token
+      # -----------------------------------------------------------------------
+      serviceAccountName: tasky-sa
+      automountServiceAccountToken: true
+
+      # Ensure pod is scheduled on a worker node (not master)
+      # Master node has taint node-role.kubernetes.io/control-plane:NoSchedule
+      # applied automatically by kubeadm - no explicit affinity needed
+      # but included for clarity
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+
+      # Restart policy for pod failures
+      restartPolicy: Always
+
+      # Image pull from ECR
+      # imagePullSecrets not needed - K8s Worker IAM role grants
+      # ecr:GetAuthorizationToken + ecr:BatchGetImage
+      # kubelet uses instance profile credentials for ECR auth
+
+      containers:
+        - name: tasky
+          # Image URI set to latest as placeholder
+          # CI/CD pipeline updates to specific commit SHA:
+          # kubectl set image deployment/tasky tasky=<ECR_URI>:<SHA>
+          image: 337909747602.dkr.ecr.us-west-2.amazonaws.com/wiztt-tasky:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # -------------------------------------------------------------------
+          # Environment Variables
+          # -------------------------------------------------------------------
+          # Both MONGODB_URI and SECRET_KEY are injected from the K8s Secret
+          # 'tasky-secrets' which is synced from AWS Secrets Manager by ESO.
+          # This satisfies the exercise requirement:
+          # "Access to MongoDB must be configured via an environment variable
+          # configured in Kubernetes"
+          # The application sees these as standard OS environment variables.
+          # -------------------------------------------------------------------
+          env:
+            # MongoDB connection URI
+            # Value: mongodb://taskyadmin:<pass>@mongodb.internal.wizdemo.ca:27017/go-mongodb?authSource=admin
+            # Consumed by: database.go CreateMongoClient() → os.Getenv("MONGODB_URI")
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: tasky-secrets
+                  key: MONGODB_URI
+                  # optional: false ensures pod fails to start if secret missing
+                  optional: false
+
+            # JWT secret key for token signing and validation
+            # Consumed by: auth.go GenerateJWT()/ValidateJWT()
+            # IMPORTANT: This is read at package init time in userController.go
+            # (var SECRET_KEY = os.Getenv("SECRET_KEY")) - K8s env var injection
+            # happens before process start, so this works correctly.
+            # Using .env file would FAIL here due to godotenv.Overload() timing.
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: tasky-secrets
+                  key: SECRET_KEY
+                  optional: false
+
+            # GIN_MODE: release reduces Gin framework logging verbosity
+            # and enables production optimizations in the HTTP router
+            - name: GIN_MODE
+              value: "release"
+
+          # -------------------------------------------------------------------
+          # Resource Limits
+          # Sized for t3.small worker node (2 vCPU, 2GB RAM)
+          # Tasky is a lightweight Go application - low resource requirements
+          # -------------------------------------------------------------------
+          resources:
+            requests:
+              # Minimum guaranteed resources
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              # Maximum allowed resources
+              # Go binary + Gin HTTP server is very lightweight
+              memory: "256Mi"
+              cpu: "500m"
+
+          # -------------------------------------------------------------------
+          # Health Probes
+          # Tasky serves login.html at "/" returning HTTP 200 when healthy
+          # -------------------------------------------------------------------
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+              scheme: HTTP
+            # Wait 30s before first check - allows MongoDB connection to establish
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+              scheme: HTTP
+            # Shorter initial delay for readiness - pod ready sooner
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          startupProbe:
+            httpGet:
+              path: /
+              port: 8080
+              scheme: HTTP
+            # Allow up to 60s for initial startup (MongoDB connection)
+            # failureThreshold * periodSeconds = 12 * 5 = 60s max
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+
+          # -------------------------------------------------------------------
+          # Volume Mounts
+          # wizexercise.txt is baked into the image at /wizexercise.txt
+          # No volume mount needed - verify with:
+          #   kubectl exec <pod> -- cat /wizexercise.txt
+          # -------------------------------------------------------------------
+
+      # -----------------------------------------------------------------------
+      # Pod-level Security Context
+      # INTENTIONAL WEAKNESSES (no securityContext restrictions):
+      #   - No runAsNonRoot: container runs as root (UID 0)
+      #   - No readOnlyRootFilesystem: container can write to filesystem
+      #   - No seccompProfile: all syscalls permitted
+      #   - No AppArmor profile: no mandatory access controls
+      #
+      # Production recommendation:
+      #   securityContext:
+      #     runAsNonRoot: true
+      #     runAsUser: 1000
+      #     runAsGroup: 1000
+      #     fsGroup: 1000
+      #     seccompProfile:
+      #       type: RuntimeDefault
+      #     readOnlyRootFilesystem: true
+      # -----------------------------------------------------------------------
+      # securityContext intentionally omitted for Wiz exercise

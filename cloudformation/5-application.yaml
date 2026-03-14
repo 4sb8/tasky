@@ -550,6 +550,12 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${EnvironmentName}/tasky/*"
                   - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/demo/dockerhub/credentials*"
+              - Sid: CloudFormationDescribe
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${EnvironmentName}-*"
       Tags:
         - Key: Name
           Value: !Sub "${EnvironmentName}-app-codebuild-role"
@@ -867,6 +873,64 @@ Resources:
 
                 - IMAGE_URI=$(cat imagedef.json | python3 -c "import json,sys; print(json.load(sys.stdin)['imageUri'])")
                 - echo "Deploying image - $IMAGE_URI"
+
+                - echo "=== Pre-build - Injecting CloudFormation ARNs into ingress manifest ==="
+                - |
+                  # Fetch ALB ARN from Stack 5 outputs
+                  ALB_ARN=$(aws cloudformation describe-stacks \
+                    --stack-name "${ENVIRONMENT_NAME}-application" \
+                    --query "Stacks[0].Outputs[?OutputKey=='ALBArn'].OutputValue" \
+                    --output text \
+                    --region $AWS_REGION)
+
+                  # Fetch ACM Certificate ARN from Stack 4 outputs
+                  CERT_ARN=$(aws cloudformation describe-stacks \
+                    --stack-name "${ENVIRONMENT_NAME}-observability" \
+                    --query "Stacks[0].Outputs[?OutputKey=='ACMCertificateArn'].OutputValue" \
+                    --output text \
+                    --region $AWS_REGION)
+
+                  # Fetch WAF Web ACL ARN from Stack 4 outputs
+                  WAF_ARN=$(aws cloudformation describe-stacks \
+                    --stack-name "${ENVIRONMENT_NAME}-observability" \
+                    --query "Stacks[0].Outputs[?OutputKey=='WAFWebACLArn'].OutputValue" \
+                    --output text \
+                    --region $AWS_REGION)
+
+                  echo "ALB ARN: $ALB_ARN"
+                  echo "CERT ARN: $CERT_ARN"
+                  echo "WAF ARN: $WAF_ARN"
+
+                  if [ -z "$ALB_ARN" ] || [ -z "$CERT_ARN" ] || [ -z "$WAF_ARN" ]; then
+                    echo "ERROR: One or more required ARNs could not be retrieved from CloudFormation"
+                    exit 1
+                  fi
+
+                  # Inject ARNs into ingress manifest annotations
+                  # Using a Python script to safely insert into YAML annotations
+                  python3 << PYEOF
+                  import re
+
+                  with open('k8s/08-ingress.yaml', 'r') as f:
+                    content = f.read()
+
+                  # Insert ARN annotations after the target-type annotation
+                  insert_after = 'alb.ingress.kubernetes.io/target-type: instance'
+                  arn_annotations = """
+                      alb.ingress.kubernetes.io/load-balancer-arn: "${ALB_ARN}"
+                      alb.ingress.kubernetes.io/certificate-arn: "${CERT_ARN}"
+                      alb.ingress.kubernetes.io/wafv2-acl-arn: "${WAF_ARN}" """
+
+                  content = content.replace(
+                    insert_after,
+                    insert_after + arn_annotations
+                  )
+
+                  with open('k8s/08-ingress.yaml', 'w') as f:
+                    f.write(content)
+
+                  print("ARNs injected into k8s/08-ingress.yaml successfully")
+                  PYEOF
 
             build:
               commands:

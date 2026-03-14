@@ -1,0 +1,57 @@
+# =============================================================================
+# WizTT - K8s Manifest: Kustomization
+# =============================================================================
+# File:            k8s/kustomization.yaml
+# Description:
+#   Kustomize configuration defining the ordered application of all
+#   K8s manifests. Used by kubectl apply -k k8s/ in the CI/CD pipeline
+#   to ensure manifests are applied in dependency order.
+#
+#   Apply order (resources list order is respected by Kustomize):
+#     1.  Namespace          - must exist before all namespaced resources
+#     2.  ServiceAccount     - must exist before ClusterRoleBinding subject
+#     3.  ClusterRoleBinding - binds SA to cluster-admin (intentional weakness)
+#     4.  ClusterSecretStore - ESO connection to Secrets Manager
+#     5.  ExternalSecret     - triggers K8s Secret creation (tasky-secrets)
+#     6.  NetworkPolicy      - applied before Deployment for immediate effect
+#     7.  Deployment         - starts pod (requires tasky-secrets to exist)
+#     8.  Service            - exposes pod on NodePort 30080
+#     9.  Ingress            - configures ALB routing rules
+#     10. Verification Job   - run by pipeline separately (not in standard apply)
+#
+# Usage:
+#   # Apply all manifests (CI/CD pipeline):
+#   kubectl apply -k k8s/
+#
+#   # Apply and wait for rollout:
+#   kubectl apply -k k8s/ && kubectl rollout status deployment/tasky -n tasky
+#
+#   # Dry run to preview changes:
+#   kubectl apply -k k8s/ --dry-run=client
+#
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Common labels applied to ALL resources managed by this Kustomization
+commonLabels:
+  app.kubernetes.io/part-of: wiztt
+  managed-by: kustomize
+  environment: wiztt
+
+# Common annotations applied to ALL resources
+commonAnnotations:
+  wiztt.io/deployed-by: "app-cicd-pipeline"
+
+resources:
+  - 01-namespace.yaml
+  - 02-serviceaccount.yaml
+  - 03-clusterrolebinding.yaml
+  - 04-clustersecretstore.yaml
+  - 05-externalsecret.yaml
+  - 09-networkpolicy.yaml
+  - 06-deployment.yaml
+  - 07-service.yaml
+  - 08-ingress.yaml
+  # 10-verification-job.yaml is applied separately by CI/CD pipeline
+  # after deployment verification, then deleted via ttlSecondsAfterFinished

@@ -1,0 +1,65 @@
+# =============================================================================
+# WizTT - K8s Manifest 03: ClusterRoleBinding
+# =============================================================================
+# File:            k8s/03-clusterrolebinding.yaml
+# Description:
+#   INTENTIONAL SECURITY WEAKNESS — Required by Wiz exercise.
+#
+#   Binds the Tasky ServiceAccount (tasky-sa) to the built-in
+#   cluster-admin ClusterRole. This grants the Tasky application pod
+#   unrestricted access to ALL Kubernetes API operations across ALL
+#   namespaces in the cluster.
+#
+#   cluster-admin permissions include:
+#     - Read/write/delete ANY resource in ANY namespace
+#     - Read ALL secrets (including other application credentials)
+#     - Create/delete nodes, persistent volumes, cluster-wide resources
+#     - Modify RBAC policies (full privilege escalation capability)
+#     - Execute commands in ANY pod in the cluster
+#
+# Real-world Risk:
+#   If the Tasky application is compromised (e.g., via the outdated
+#   JWT library CVE, or injection attack), the attacker inherits
+#   cluster-admin privileges and can:
+#     1. kubectl get secrets --all-namespaces (steal all credentials)
+#     2. kubectl exec into any pod (lateral movement)
+#     3. kubectl create pod with hostPath mounts (node escape)
+#     4. Modify or delete cluster infrastructure
+#
+# Wiz Finding Expected:
+#   - Critical: Workload with cluster-admin ClusterRoleBinding
+#   - Critical: Container with excessive K8s API permissions
+#
+# Production Recommendation:
+#   Replace with a scoped Role and RoleBinding granting only:
+#     - get/list/watch on pods in the tasky namespace
+#   Never use cluster-admin for application workloads.
+#
+# Deployed By:     App CI/CD Pipeline (CodeBuild K8s deploy stage)
+# Depends On:      02-serviceaccount.yaml
+# =============================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tasky-cluster-admin-binding
+  labels:
+    app.kubernetes.io/name: tasky
+    app.kubernetes.io/part-of: wiztt
+    environment: wiztt
+    managed-by: kubectl
+  annotations:
+    description: >
+      INTENTIONAL WEAKNESS: Grants cluster-admin to Tasky ServiceAccount.
+      Required by Wiz Technical Exercise.
+      DO NOT replicate in production environments.
+      Production: use scoped Role/RoleBinding in tasky namespace only.
+# Binds TO the built-in cluster-admin ClusterRole
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+# Binds the tasky-sa ServiceAccount as the subject
+subjects:
+  - kind: ServiceAccount
+    name: tasky-sa
+    namespace: tasky

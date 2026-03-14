@@ -1,0 +1,28 @@
+# =============================================================================
+# WizTT - K8s Manifest 01: Namespace
+# =============================================================================
+# File:            k8s/01-namespace.yaml
+# Description:
+#   Creates the dedicated namespace for the WizTT Tasky application.
+#   Using a dedicated namespace (rather than default) is best practice
+#   as it provides logical isolation, scoped RBAC, and resource quotas.
+#
+#   NOTE: The ClusterRoleBinding in 03-clusterrolebinding.yaml grants
+#   cluster-admin to the tasky ServiceAccount - this intentional weakness
+#   applies cluster-wide regardless of namespace isolation.
+#
+# Deployed By:     App CI/CD Pipeline (CodeBuild K8s deploy stage)
+# Depends On:      K8s cluster initialized (Stack 3)
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tasky
+  labels:
+    # Standard K8s recommended labels for resource identification
+    app.kubernetes.io/name: tasky
+    app.kubernetes.io/part-of: wiztt
+    environment: wiztt
+    managed-by: kubectl
+  annotations:
+    description: "WizTT Tasky application namespace"
