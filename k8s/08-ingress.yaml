@@ -4,33 +4,25 @@
 # File:            k8s/08-ingress.yaml
 # Description:
 #   Defines the K8s Ingress resource for the Tasky application.
-#   Uses AWS Load Balancer Controller annotations to reference the
-#   pre-existing ALB created by Stack 5 CloudFormation.
+#   Uses AWS Load Balancer Controller to CREATE and MANAGE the ALB.
 #
-#   Two approaches exist for ALB + K8s Ingress:
-#     A) Let AWS LB Controller CREATE a new ALB (via ingress annotations)
-#     B) Reference a pre-existing ALB (created by CloudFormation)
+#   The AWS LB Controller owns the full ALB lifecycle:
+#     - Creates ALB on first deploy
+#     - Manages listeners, target groups, and routing rules
+#     - Deletes ALB when Ingress is deleted (before stack teardown)
 #
-#   This manifest uses Approach B (reference pre-existing ALB) because:
-#     - The ALB is managed as IaC in Stack 5 (better lifecycle management)
-#     - WAF association is handled by CloudFormation (Stack 5)
-#     - ACM certificate is managed by CloudFormation (Stack 4)
-#     - Route 53 ALIAS is managed by CloudFormation (Stack 5)
+#   ACM certificate and WAF ARNs are injected at deploy time by the
+#   K8s deploy CodeBuild stage from CloudFormation stack outputs.
 #
-#   The AWS LB Controller still manages TARGET GROUP registration,
-#   routing rules, and listener rules via this Ingress resource.
+#   Route 53 ALIAS record points to the LB controller ALB DNS name.
+#   The DNS record is managed by Stack 4 and updated by the pipeline.
 #
-#   Prerequisites:
-#     AWS Load Balancer Controller installed via Helm:
-#       helm repo add eks https://aws.github.io/eks-charts
-#       helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
-#         --namespace kube-system \
-#         --set clusterName=demo \
-#         --set serviceAccount.create=false \
-#         --set serviceAccount.name=aws-load-balancer-controller
+#   TEARDOWN NOTE: Delete this Ingress resource BEFORE deleting stacks
+#   to allow the LB controller to clean up the ALB and its security groups.
+#   kubectl delete ingress tasky-ingress -n tasky
 #
 # Deployed By:     App CI/CD Pipeline (CodeBuild K8s deploy stage)
-# Depends On:      07-service.yaml, ALB exists (Stack 5)
+# Depends On:      07-service.yaml, AWS LB Controller installed
 # =============================================================================
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -44,7 +36,7 @@ metadata:
     environment: demo
     managed-by: kubectl
   annotations:
-    description: "K8s Ingress for Tasky application via AWS ALB"
+    description: "K8s Ingress for Tasky application - ALB managed by LB Controller"
 
     # -------------------------------------------------------------------------
     # AWS Load Balancer Controller Annotations
@@ -60,34 +52,24 @@ metadata:
     # Using 'instance' for self-managed K8s (no VPC CNI / no EKS)
     alb.ingress.kubernetes.io/target-type: instance
 
-    # ALB ARN injected at deploy time by K8s deploy CodeBuild stage
-    # from CloudFormation stack outputs. This tells the LB controller
-    # to attach to the existing CF-managed ALB instead of creating a new one.
-    # The load-balancer-arn annotation requires the group.name annotation
-    # to work correctly - both must be present.
-    alb.ingress.kubernetes.io/load-balancer-arn: "REPLACE_WITH_ALB_ARN"
-
-    # IngressGroup causes the LB controller to attach to the existing ALB
-    # rather than creating a new one. Required when using load-balancer-arn.
-    alb.ingress.kubernetes.io/group.name: "wiztt"
-    alb.ingress.kubernetes.io/group.order: "10"
-
-    # Certificate ARN injected at deploy time
+    # ACM certificate ARN injected at deploy time by K8s deploy CodeBuild
+    # stage from Stack 4 CloudFormation outputs (ACMCertificateArn)
     alb.ingress.kubernetes.io/certificate-arn: "REPLACE_WITH_CERT_ARN"
 
     # HTTPS listener on port 443
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
 
-    # Modern TLS policy matching Stack 5 ALB listener configuration
+    # Modern TLS policy
     alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
 
     # Redirect HTTP to HTTPS at ALB level
     alb.ingress.kubernetes.io/ssl-redirect: "443"
 
-    # WAF ARN injected at deploy time
+    # WAF Web ACL ARN injected at deploy time by K8s deploy CodeBuild
+    # stage from Stack 4 CloudFormation outputs (WAFWebACLArn)
     alb.ingress.kubernetes.io/wafv2-acl-arn: "REPLACE_WITH_WAF_ARN"
 
-    # Health check configuration matching ALB Target Group (Stack 5)
+    # Health check configuration
     alb.ingress.kubernetes.io/healthcheck-path: /
     alb.ingress.kubernetes.io/healthcheck-port: "30080"
     alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
@@ -96,7 +78,11 @@ metadata:
     alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
     alb.ingress.kubernetes.io/success-codes: "200-399"
 
-    # Tags applied to ALB resources created/managed by LB Controller
+    # Security group for the ALB - use the CF-managed ALB security group
+    # from Stack 2 to keep security rules in IaC
+    alb.ingress.kubernetes.io/security-groups: "REPLACE_WITH_ALB_SG_ID"
+
+    # Tags applied to ALB resources created by LB Controller
     alb.ingress.kubernetes.io/tags: >-
       Environment=demo,
       Project=WizTT,
@@ -104,7 +90,6 @@ metadata:
 
 spec:
   # Default backend for unmatched requests
-  # Routes all traffic to tasky-service (single application)
   defaultBackend:
     service:
       name: tasky-service
