@@ -1347,7 +1347,7 @@ Resources:
 
           chmod +x /usr/local/bin/mongodb-backup.sh
 
-          echo "0 * * * * root /usr/local/bin/mongodb-backup.sh >> /var/log/mongodb-backup.log 2>&1" \
+          echo "0 2 * * * root /usr/local/bin/mongodb-backup.sh >> /var/log/mongodb-backup.log 2>&1" \
             > /etc/cron.d/mongodb-backup
 
           systemctl enable crond
@@ -1890,6 +1890,28 @@ Resources:
             systemctl status kubelet
             exit 1
           fi
+
+          # -----------------------------------------------------------------
+          # Step 8b: Set providerID on worker node for AWS LB Controller
+          # -----------------------------------------------------------------
+          echo "=== Step 8b: Setting providerID on worker node ==="
+          
+          AZ=$(curl -s -H "X-aws-ec2-metadata-token: ${!IMDS_TOKEN}" \
+            http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+          # Poll until node appears then patch providerID
+          KUBECONFIG_B64=$(aws ssm get-parameter \
+            --name "/${EnvironmentName}/k8s/admin-kubeconfig" \
+            --with-decryption --query "Parameter.Value" \
+            --output text --region ${AWS::Region})
+
+          echo "${!KUBECONFIG_B64}" | base64 -d > /tmp/kube.conf
+          chmod 600 /tmp/kube.conf
+
+          KUBECONFIG=/tmp/kube.conf kubectl patch node "$(hostname -f)" \
+            -p "{\"spec\":{\"providerID\":\"aws:///${!AZ}/${!INSTANCE_ID}\"}}"
+
+          rm -f /tmp/kube.conf
 
           # -----------------------------------------------------------------
           # Step 9: Final verification and CloudFormation signal
